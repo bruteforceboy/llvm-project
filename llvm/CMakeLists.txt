@@ -564,6 +564,11 @@ if(EJIT_FREESTANDING)
   add_definitions(-DEJIT_FREESTANDING)
 endif()
 
+option(EJIT_DISABLE_OPT_PIPELINE "Disable EJIT optimization pipeline" OFF)
+if(EJIT_DISABLE_OPT_PIPELINE)
+  add_definitions(-DEJIT_DISABLE_OPT_PIPELINE)
+endif()
+
 set(LLVM_TARGETS_TO_BUILD "all"
     CACHE STRING "Semicolon-separated list of targets to build, or \"all\".")
 

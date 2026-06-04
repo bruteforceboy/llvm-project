@@ -115,7 +115,9 @@ EJitOrcEngine::Create(const Config &config,
           if (!ctx)
             return;
 
-          EJitOptimizer opt(periodReg);
+          #ifndef EJIT_DISABLE_OPT_PIPELINE
+            EJitOptimizer opt(periodReg);
+          #endif
 
           // Dump pre-optimization IR if configured.
           if (!engine->P->dumpJITDir.empty()) {
@@ -128,7 +130,9 @@ EJitOrcEngine::Create(const Config &config,
               M.print(OS, nullptr);
           }
 
-          opt.runPipeline(M, *ctx);
+          #ifndef EJIT_DISABLE_OPT_PIPELINE
+            opt.runPipeline(M, *ctx);
+          #endif
 
           // Dump post-optimization IR if configured.
           if (!engine->P->dumpJITDir.empty()) {

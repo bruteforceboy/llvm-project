@@ -51,29 +51,55 @@ foreach(_t ${LLVM_TARGETS_TO_BUILD})
   list(APPEND EJIT_TARGET_COMPONENTS ${_t}CodeGen ${_t}Desc ${_t}Info)
 endforeach()
 
+if(EJIT_DISABLE_OPT_PIPELINE)
+  message(STATUS "EmbeddedJIT: disable EJIT opt pipeline mode enabled")
+endif()
+
 set(EJIT_SOURCES
   EJit.cpp
   EJitRuntime.cpp
-  EJitRegistration.cpp
   EJitRegistryTable.c
   EJitOrcEngine.cpp
   EJitCompileDriver.cpp
   EJitCache.cpp
   EJitRuntimeState.cpp
   EJitModuleLoader.cpp
-  EJitLogger.cpp
   EJitRegistrationStore.cpp
-  EJitStructFieldPass.cpp
-  EJitOptimizer.cpp
-  EJitPassBuilder.cpp
 )
 
 # Async/sync compiler — excluded in freestanding mode (single-threaded, no std::thread)
 if(NOT EJIT_FREESTANDING)
   list(APPEND EJIT_SOURCES
+    EJitLogger.cpp
     EJitSyncCompiler.cpp
     EJitAsyncCompiler.cpp
   )
+endif()
+
+if(NOT EJIT_DISABLE_OPT_PIPELINE)
+  list(APPEND EJIT_SOURCES
+    EJitStructFieldPass.cpp
+    EJitPassBuilder.cpp
+    EJitOptimizer.cpp
+  )
+endif()
+
+set(EJIT_LINK_COMPONENTS
+  BitReader
+  Core
+  OrcJIT
+  JITLink
+  Support
+  ${EJIT_TARGET_COMPONENTS}
+  # IPO and Scalar are not listed here — their LINK_COMPONENTS would
+  # recursively pull in BitWriter, Instrumentation, Linker, AsmParser,
+  # and AggressiveInstCombine.  Instead, they are added manually to the
+  # ejit_minimal target below (see §6.5 of EJIT_LIBRARY_TRIMMING.md).
+  # ExecutionEngine is not listed — it's already pulled by OrcJIT.
+)
+
+if(NOT EJIT_DISABLE_OPT_PIPELINE)
+  list(APPEND EJIT_LINK_COMPONENTS TransformUtils Analysis InstCombine)
 endif()
 
 add_llvm_component_library(LLVMEJIT
@@ -82,20 +108,7 @@ add_llvm_component_library(LLVMEJIT
   PARTIAL_SOURCES_INTENDED
 
   LINK_COMPONENTS
-  BitReader
-  Core
-  OrcJIT
-  JITLink
-  Support
-  InstCombine
-  TransformUtils
-  Analysis
-  ${EJIT_TARGET_COMPONENTS}
-  # IPO and Scalar are not listed here — their LINK_COMPONENTS would
-  # recursively pull in BitWriter, Instrumentation, Linker, AsmParser,
-  # and AggressiveInstCombine.  Instead, they are added manually to the
-  # ejit_minimal target below (see §6.5 of EJIT_LIBRARY_TRIMMING.md).
-  # ExecutionEngine is not listed — it's already pulled by OrcJIT.
+  ${EJIT_LINK_COMPONENTS}
   )
 
 # Propagate the target triple setting to the C++ code
