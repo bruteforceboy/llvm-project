@@ -1,4 +1,4 @@
-if(NOT EJIT_TRIM_LLVM_BACKEND_EXPERIMENTAL)
+if(NOT EJIT_TRIM_LLVM_BACKEND_EXPERIMENTAL AND NOT EJIT_TRIM_LLVM_BACKEND)
   set(LLVM_TARGET_DEFINITIONS COFFOptions.td)
   tablegen(LLVM COFFOptions.inc -gen-opt-parser-defs)
   add_public_tablegen_target(JITLinkTableGen)
@@ -47,7 +47,7 @@ set(JITLINK_ARCH_X86
 
 set(JITLINK_DEPENDS intrinsics_gen)
 
-if(NOT EJIT_TRIM_LLVM_BACKEND_EXPERIMENTAL)
+if(NOT EJIT_TRIM_LLVM_BACKEND_EXPERIMENTAL AND NOT EJIT_TRIM_LLVM_BACKEND)
   # Normal build: include everything
   list(APPEND JITLINK_SOURCES ${JITLINK_MACHO_COFF})
   list(APPEND JITLINK_SOURCES ${JITLINK_ELF_OTHER})
@@ -55,11 +55,12 @@ if(NOT EJIT_TRIM_LLVM_BACKEND_EXPERIMENTAL)
   list(APPEND JITLINK_SOURCES ${JITLINK_ARCH_X86})
   list(APPEND JITLINK_DEPENDS JITLinkTableGen)
 elseif(LLVM_TARGETS_TO_BUILD STREQUAL "AArch64")
-  # AArch64 bare-metal: ELF only, AArch64 only.  Include aarch32 to
-  # satisfy extern declarations transitively included via ELF_aarch32.h.
+  # AArch64 with EJIT_TRIM_LLVM_BACKEND or bare-metal EXPERIMENTAL:
+  # ELF only, AArch64 only.  Include aarch32 to satisfy extern declarations
+  # transitively included via ELF_aarch32.h.
   list(APPEND JITLINK_SOURCES aarch32.cpp)
 else()
-  # x86 bare-metal: ELF + MachO + COFF, x86 arch support
+  # x86 bare-metal (EXPERIMENTAL only): ELF + MachO + COFF, x86 arch support
   list(APPEND JITLINK_SOURCES ${JITLINK_MACHO_COFF})
   list(APPEND JITLINK_SOURCES ${JITLINK_ARCH_X86})
 endif()

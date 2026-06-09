@@ -554,7 +554,13 @@ set(LLVM_ALL_EXPERIMENTAL_TARGETS
 # List of targets with JIT support:
 set(LLVM_TARGETS_WITH_JIT X86 PowerPC AArch64 ARM Mips SystemZ)
 
-option(EJIT_TRIM_LLVM_BACKEND "Trim LLVM backend pieces used by EJIT: disable heavyweight debug info, GlobalISel, and optional AArch64 SME/SVE passes" OFF)
+option(EJIT_TRIM_LLVM_BACKEND
+  "Trim LLVM backend for EJIT embedded use: \
+excludes GlobalISel, SME/SVE passes, DWARF/CodeView debug info, \
+AsmPrinter COFF/MachO/Wasm exception handlers, ObjCARC/CFGuard pass \
+registration, non-ELF JITLink backends (COFF/MachO/XCOFF/non-AArch64 ELF), \
+OrcJIT COFF/MachO platforms, and COFF/MachO RuntimeDyld paths. \
+Safe for AArch64 Linux ELF targets; all ejit tests pass." OFF)
 if(EJIT_TRIM_LLVM_BACKEND)
   add_definitions(-DEJIT_TRIM_LLVM_BACKEND)
 endif()

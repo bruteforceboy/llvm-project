@@ -11,6 +11,13 @@
 //===----------------------------------------------------------------------===//
 
 #include "llvm/ExecutionEngine/RuntimeDyld.h"
+
+// EJIT_TRIM_LLVM_BACKEND: exclude COFF/MachO RuntimeDyld paths (Linux ELF only).
+// Use the same code paths as EXPERIMENTAL for this file.
+#if defined(EJIT_TRIM_LLVM_BACKEND) && !defined(EJIT_TRIM_LLVM_BACKEND_EXPERIMENTAL)
+#define EJIT_TRIM_LLVM_BACKEND_EXPERIMENTAL
+#endif
+
 #ifndef EJIT_TRIM_LLVM_BACKEND_EXPERIMENTAL
 #include "RuntimeDyldCOFF.h"
 #endif

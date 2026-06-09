@@ -16,7 +16,8 @@
 #   -b              build only (skip configure)
 #   --static        debug build with static libs (for ejit_test with assertions)
 #   --no-ccache     disable ccache
-#   --trim-llvm-backend-experimental    build with EJIT_TRIM_LLVM_BACKEND_EXPERIMENTAL=ON (backend: trim non-ELF formats)
+#   --trim-llvm-backend                 build with EJIT_TRIM_LLVM_BACKEND=ON (trim non-ELF JITLink/ORC/RuntimeDyld, GlobalISel, debug info)
+#   --trim-llvm-backend-experimental    build with EJIT_TRIM_LLVM_BACKEND_EXPERIMENTAL=ON (bare-metal: also trim non-ELF MC/Object layers)
 #   --freestanding  build with EJIT_FREESTANDING=ON (runtime: no OS threads/I/O)
 #   --target-triple=<triple>  set EJIT_DEFAULT_TARGET_TRIPLE (required for
 #   -h              show help
@@ -147,6 +148,7 @@ do_configure() {
       -DLLVM_ENABLE_PROJECTS="clang;lld" \
       "-DCMAKE_C_COMPILER=${cc}" \
       "-DCMAKE_CXX_COMPILER=${cxx}" \
+      -DEJIT_TRIM_LLVM_BACKEND=${EJIT_TRIM_LLVM_BACKEND} \
       -DEJIT_TRIM_LLVM_BACKEND_EXPERIMENTAL=${EJIT_TRIM_LLVM_BACKEND_EXPERIMENTAL} \
       -DEJIT_FREESTANDING=${EJIT_FREESTANDING} \
       ${EJIT_TARGET_TRIPLE:+-DEJIT_DEFAULT_TARGET_TRIPLE="${EJIT_TARGET_TRIPLE}"} \
@@ -178,6 +180,7 @@ do_configure() {
       -DLLVM_ENABLE_PROJECTS="clang;lld" \
       "-DCMAKE_C_COMPILER=${cc}" \
       "-DCMAKE_CXX_COMPILER=${cxx}" \
+      -DEJIT_TRIM_LLVM_BACKEND=${EJIT_TRIM_LLVM_BACKEND} \
       -DEJIT_TRIM_LLVM_BACKEND_EXPERIMENTAL=${EJIT_TRIM_LLVM_BACKEND_EXPERIMENTAL} \
       -DEJIT_FREESTANDING=${EJIT_FREESTANDING} \
       ${EJIT_TARGET_TRIPLE:+-DEJIT_DEFAULT_TARGET_TRIPLE="${EJIT_TARGET_TRIPLE}"} \
@@ -225,6 +228,7 @@ VARIANT="default"
 DO_CONFIGURE=true
 DO_BUILD=true
 USE_CCACHE=true
+EJIT_TRIM_LLVM_BACKEND=OFF
 EJIT_TRIM_LLVM_BACKEND_EXPERIMENTAL=OFF
 EJIT_FREESTANDING=OFF
 EJIT_TARGET_TRIPLE=""
@@ -237,6 +241,7 @@ while [[ $# -gt 0 ]]; do
     -c) DO_BUILD=false ;;
     -b) DO_CONFIGURE=false ;;
     --no-ccache) USE_CCACHE=false ;;
+    --trim-llvm-backend) EJIT_TRIM_LLVM_BACKEND=ON ;;
     --trim-llvm-backend-experimental) EJIT_TRIM_LLVM_BACKEND_EXPERIMENTAL=ON ;;
     --freestanding) EJIT_FREESTANDING=ON ;;
     --target-triple=*) EJIT_TARGET_TRIPLE="${1#--target-triple=}" ;;

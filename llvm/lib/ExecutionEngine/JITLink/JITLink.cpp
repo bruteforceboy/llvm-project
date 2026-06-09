@@ -8,6 +8,12 @@
 
 #include "llvm/ExecutionEngine/JITLink/JITLink.h"
 
+// EJIT_TRIM_LLVM_BACKEND: exclude non-ELF/non-AArch64 JITLink backends.
+// Use the same code paths as EXPERIMENTAL for this file.
+#if defined(EJIT_TRIM_LLVM_BACKEND) && !defined(EJIT_TRIM_LLVM_BACKEND_EXPERIMENTAL)
+#define EJIT_TRIM_LLVM_BACKEND_EXPERIMENTAL
+#endif
+
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/BinaryFormat/Magic.h"
 #ifndef EJIT_TRIM_LLVM_BACKEND_EXPERIMENTAL
