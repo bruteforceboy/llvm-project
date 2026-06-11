@@ -60,7 +60,9 @@ elseif(LLVM_TARGETS_TO_BUILD STREQUAL "AArch64")
   # transitively included via ELF_aarch32.h.
   list(APPEND JITLINK_SOURCES aarch32.cpp)
 else()
-  # x86 bare-metal (EXPERIMENTAL only): ELF + MachO + COFF, x86 arch support
+  # x86 with EJIT_TRIM_LLVM_BACKEND (or EXPERIMENTAL): ELF + MachO + COFF, x86
+  # arch support.  aarch32.cpp needed by LinkGraphLinkingLayer.cpp (hasTargetFlags).
+  list(APPEND JITLINK_SOURCES aarch32.cpp)
   list(APPEND JITLINK_SOURCES ${JITLINK_MACHO_COFF})
   list(APPEND JITLINK_SOURCES ${JITLINK_ARCH_X86})
 endif()
