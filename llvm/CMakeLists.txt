@@ -563,6 +563,11 @@ OrcJIT COFF/MachO platforms, and COFF/MachO RuntimeDyld paths. \
 Safe for AArch64 Linux ELF targets; all ejit tests pass." OFF)
 if(EJIT_TRIM_LLVM_BACKEND)
   add_definitions(-DEJIT_TRIM_LLVM_BACKEND)
+  # When trimming for AArch64, exclude non-AArch64 JITLink/ELF backends.
+  # On X86 builds keep the X86 ELF dispatch intact.
+  if(LLVM_TARGETS_TO_BUILD STREQUAL "AArch64")
+    add_definitions(-DEJIT_TRIM_JITLINK_AARCH64_ONLY)
+  endif()
 endif()
 
 option(EJIT_TRIM_LLVM_BACKEND_EXPERIMENTAL "Trim backend for bare-metal: exclude non-ELF formats, non-AArch64 targets, DWARF/CFI" OFF)

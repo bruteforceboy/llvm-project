@@ -8,9 +8,9 @@
 
 #include "llvm/ExecutionEngine/JITLink/JITLink.h"
 
-// EJIT_TRIM_LLVM_BACKEND: exclude non-ELF/non-AArch64 JITLink backends.
-// Use the same code paths as EXPERIMENTAL for this file.
-#if defined(EJIT_TRIM_LLVM_BACKEND) && !defined(EJIT_TRIM_LLVM_BACKEND_EXPERIMENTAL)
+// On AArch64-only EJIT builds, restrict JITLink dispatch to AArch64/ELF.
+// On X86 builds with EJIT_TRIM_LLVM_BACKEND, full dispatch must remain.
+#if defined(EJIT_TRIM_JITLINK_AARCH64_ONLY) && !defined(EJIT_TRIM_LLVM_BACKEND_EXPERIMENTAL)
 #define EJIT_TRIM_LLVM_BACKEND_EXPERIMENTAL
 #endif
 
