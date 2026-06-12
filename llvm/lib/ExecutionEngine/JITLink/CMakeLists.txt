@@ -1,4 +1,4 @@
-if(NOT EJIT_TRIM_LLVM_BACKEND_EXPERIMENTAL AND NOT EJIT_TRIM_LLVM_BACKEND)
+if (NOT EJIT_TRIM_LLVM_BACKEND OR NOT LLVM_TARGETS_TO_BUILD STREQUAL "AArch64")
   set(LLVM_TARGET_DEFINITIONS COFFOptions.td)
   tablegen(LLVM COFFOptions.inc -gen-opt-parser-defs)
   add_public_tablegen_target(JITLinkTableGen)
@@ -47,24 +47,17 @@ set(JITLINK_ARCH_X86
 
 set(JITLINK_DEPENDS intrinsics_gen)
 
-if(NOT EJIT_TRIM_LLVM_BACKEND_EXPERIMENTAL AND NOT EJIT_TRIM_LLVM_BACKEND)
+if(EJIT_TRIM_LLVM_BACKEND AND LLVM_TARGETS_TO_BUILD STREQUAL "AArch64")
+  # AArch64 with EJIT_TRIM_LLVM_BACKEND: ELF only, AArch64 only.  aarch32.cpp
+  # needed by LinkGraphLinkingLayer.cpp (hasTargetFlags).
+  list(APPEND JITLINK_SOURCES aarch32.cpp)
+else()
   # Normal build: include everything
   list(APPEND JITLINK_SOURCES ${JITLINK_MACHO_COFF})
   list(APPEND JITLINK_SOURCES ${JITLINK_ELF_OTHER})
   list(APPEND JITLINK_SOURCES ${JITLINK_BLOAT})
   list(APPEND JITLINK_SOURCES ${JITLINK_ARCH_X86})
   list(APPEND JITLINK_DEPENDS JITLinkTableGen)
-elseif(LLVM_TARGETS_TO_BUILD STREQUAL "AArch64")
-  # AArch64 with EJIT_TRIM_LLVM_BACKEND or bare-metal EXPERIMENTAL:
-  # ELF only, AArch64 only.  Include aarch32 to satisfy extern declarations
-  # transitively included via ELF_aarch32.h.
-  list(APPEND JITLINK_SOURCES aarch32.cpp)
-else()
-  # x86 with EJIT_TRIM_LLVM_BACKEND (or EXPERIMENTAL): ELF + MachO + COFF, x86
-  # arch support.  aarch32.cpp needed by LinkGraphLinkingLayer.cpp (hasTargetFlags).
-  list(APPEND JITLINK_SOURCES aarch32.cpp)
-  list(APPEND JITLINK_SOURCES ${JITLINK_MACHO_COFF})
-  list(APPEND JITLINK_SOURCES ${JITLINK_ARCH_X86})
 endif()
 
 add_llvm_component_library(LLVMJITLink
