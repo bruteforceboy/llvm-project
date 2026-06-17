@@ -8,6 +8,9 @@
 #include "llvm/IR/Module.h"
 #include "llvm/ExecutionEngine/EJIT/EJitPassBuilder.h"
 #include "llvm/Support/Debug.h"
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
 // JIT Inline disabled: AOT pre-optimization already inlines.
 // #include "llvm/Transforms/IPO/AlwaysInliner.h"
 #include "llvm/Transforms/InstCombine/InstCombine.h"
@@ -23,6 +26,32 @@ using namespace llvm;
 using namespace llvm::ejit;
 
 #define DEBUG_TYPE "ejit-optimizer"
+
+namespace {
+
+static bool ejitTracePasses() {
+  static int cached = -1;
+  if (cached < 0)
+    cached = (std::getenv("EJIT_TRACE_PASSES") != nullptr) ? 1 : 0;
+  return cached != 0;
+}
+
+struct PassTimer {
+  using Clock = std::chrono::steady_clock;
+  Clock::time_point t0;
+  const char *name;
+  explicit PassTimer(const char *n) : t0(Clock::now()), name(n) {}
+  ~PassTimer() {
+    if (!ejitTracePasses()) return;
+    auto us = std::chrono::duration_cast<std::chrono::microseconds>(
+                  Clock::now() - t0)
+                  .count();
+    std::fprintf(stderr, "[ejit-passes] %-30s %6lld us\n", name,
+                 static_cast<long long>(us));
+  }
+};
+
+} // namespace
 
 EJitOptimizer::EJitOptimizer(PeriodArrayRegistry &reg)
     : registry_(reg) {
@@ -62,29 +91,20 @@ void EJitOptimizer::clearAnalyses() {
 void EJitOptimizer::runPipeline(Module &M,
                                 const SpecializationContext &ctx) {
   // 1. Parameter substitution: replace ejit_period_arr_ind args with constants
-  preReplacePeriodIndices(M, ctx);
+  { PassTimer _t("preReplacePeriodIndices"); preReplacePeriodIndices(M, ctx); }
 
   // 2. InstCombine: fold constant GEP chains from substituted params
   //    so StructFieldPass can compute correct byte offsets.
-  runInstCombine(M);
+  { PassTimer _t("InstCombine (pre-struct)"); runInstCombine(M); }
 
-  // 3. Inline (L2+): currently disabled. The AOT pre-optimization in
-  //    EJitRegisterBitcodePass already runs AlwaysInline + ModuleInliner(O2),
-  //    so callee bodies are already expanded in the embedded bitcode and
-  //    their may_const GEP chains are directly traceable to global variables.
-  //    Skipping this saves JIT compile time at the cost of missing inlines
-  //    that only become profitable after parameter substitution.
-  // if (static_cast<int>(ctx.optLevel) >= 2) {
-  //   ModulePassManager MPM;
-  //   MPM.addPass(AlwaysInlinerPass());
-  //   MPM.run(M, MAM_);
-  // }
+  // 3. Inline (L2+): currently disabled.
+  // if (static_cast<int>(ctx.optLevel) >= 2) { ... }
 
   // 4. StructFieldPass: replace may_const loads with runtime constants.
-  runStructFieldPass(M);
+  { PassTimer _t("StructFieldPass"); runStructFieldPass(M); }
 
   // 5. Core optimization at the configured level
-  runOptimizationPipeline(M, ctx.optLevel);
+  { PassTimer _t("OptimizationPipeline"); runOptimizationPipeline(M, ctx.optLevel); }
 }
 
 void EJitOptimizer::preReplacePeriodIndices(
@@ -145,32 +165,30 @@ void EJitOptimizer::runStructFieldPass(Module &M) {
 
 void EJitOptimizer::runOptimizationPipeline(Module &M,
                                             OptimizationLevel level) {
-  // L1: SCCP + ADCE + SimplifyCFG — constant propagation, dead code
-  // elimination, and CFG cleanup. Captures the vast majority of EJIT
-  // performance gains (may_const load → constant → branch folding).
-  // L1FPM_ is pre-built in the constructor and reused across compilations.
-  for (Function &F : M.functions())
-    if (!F.isDeclaration())
-      L1FPM_.run(F, FAM_);
+  // L1: SCCP + ADCE + SimplifyCFG
+  { PassTimer _t("L1: SCCP+ADCE+SimplifyCFG");
+    for (Function &F : M.functions())
+      if (!F.isDeclaration())
+        L1FPM_.run(F, FAM_);
+  }
 
-  // L2: SimplifyCFG cleanup. Inline now runs in runPipeline (before
-  // StructFieldPass), so no need to re-run StructFieldPass here.
+  // L2: SimplifyCFG cleanup
   if (static_cast<int>(level) >= 2) {
+    PassTimer _t("L2: SimplifyCFG");
     for (Function &F : M.functions())
       if (!F.isDeclaration())
         L2FPM_.run(F, FAM_);
   }
 
-  // L3: Unroll small loops with may_const-dependent bodies. Re-run
-  // StructFieldPass because loop unrolling can turn loop-variant GEP
-  // indices into constants (e.g. g_cfg[i].field → g_cfg[0].field,
-  // g_cfg[1].field after unrolling).
+  // L3: LoopSimplify + FullUnroll + Promote + SimplifyCFG, then re-run
+  // StructFieldPass because unrolling can expose new may_const GEPs.
   if (static_cast<int>(level) >= 3) {
-    for (Function &F : M.functions())
-      if (!F.isDeclaration())
-        L3FPM_.run(F, FAM_);
-
-    runStructFieldPass(M);
-    runInstCombine(M);
+    { PassTimer _t("L3: LoopSimplify+Unroll+Promote");
+      for (Function &F : M.functions())
+        if (!F.isDeclaration())
+          L3FPM_.run(F, FAM_);
+    }
+    { PassTimer _t("L3: StructFieldPass (post-unroll)"); runStructFieldPass(M); }
+    { PassTimer _t("L3: InstCombine (post-unroll)");     runInstCombine(M); }
   }
 }
