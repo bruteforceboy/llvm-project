@@ -21,6 +21,9 @@ namespace ejit {
 
 class EJitOrcEngine;
 class EJitLogger;
+#ifndef EJIT_FREESTANDING
+class EJitAsyncCompiler;
+#endif
 
 /// Unified entry point for sync and async compilation. Handles cache
 /// lookup, time-window state verification, bitcode retrieval, and
@@ -60,6 +63,9 @@ public:
 
   void setSyncEngine(std::unique_ptr<EJitOrcEngine> engine);
   void registerSymbol(const std::string &name, void *addr);
+#ifndef EJIT_FREESTANDING
+  void setAsyncCompiler(std::unique_ptr<EJitAsyncCompiler> compiler);
+#endif
 
 private:
   const Config &config_;
@@ -71,7 +77,9 @@ private:
 #endif
 
   std::unique_ptr<EJitOrcEngine> syncEngine_;
-  // Async compiler will be added in EJitAsyncCompiler phase
+#ifndef EJIT_FREESTANDING
+  std::unique_ptr<EJitAsyncCompiler> asyncCompiler_;
+#endif
 };
 
 } // namespace ejit

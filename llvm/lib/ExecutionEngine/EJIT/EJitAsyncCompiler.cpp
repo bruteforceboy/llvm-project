@@ -46,6 +46,11 @@ void EJitAsyncCompiler::stop() {
   stopping_ = false;
 }
 
+void EJitAsyncCompiler::addUserSymbol(const std::string &name, void *addr) {
+  if (workerEngine_)
+    workerEngine_->addUserSymbol(name, addr);
+}
+
 void EJitAsyncCompiler::submitRequest(CompileRequest req) {
   // Dedup: skip if same key is already in flight
   {

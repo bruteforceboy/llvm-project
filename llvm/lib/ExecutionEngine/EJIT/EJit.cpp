@@ -2,6 +2,7 @@
 
 #include "llvm/ExecutionEngine/EJIT/EJit.h"
 #include "llvm/Config/Targets.h"
+#include "llvm/ExecutionEngine/EJIT/EJitAsyncCompiler.h"
 #include "llvm/ExecutionEngine/EJIT/EJitCompileDriver.h"
 #include "llvm/ExecutionEngine/EJIT/EJitDiag.h"
 #include "llvm/ExecutionEngine/EJIT/EJitLogger.h"
@@ -155,6 +156,17 @@ EJit::EJit(const Config &config) : config_(config) {
       (*engine)->addUserSymbol(sym.name, sym.addr);
     compileDriver_->setSyncEngine(std::move(*engine));
     EJIT_DIAG("OrcJIT engine created successfully");
+#ifndef EJIT_FREESTANDING
+    if (config_.compileMode == CompileMode::Async) {
+      auto async = std::make_unique<EJitAsyncCompiler>(
+          config_, *cache_, *runtimeState_);
+      for (auto &sym : data.userSymbols)
+        async->addUserSymbol(sym.name, sym.addr);
+      async->start();
+      compileDriver_->setAsyncCompiler(std::move(async));
+      EJIT_DIAG("async compiler started");
+    }
+#endif
   } else {
     EJIT_DIAG("FAILED to create OrcJIT engine");
 #ifndef EJIT_FREESTANDING

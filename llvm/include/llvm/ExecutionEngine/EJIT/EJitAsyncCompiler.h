@@ -53,6 +53,9 @@ public:
   /// Submit a compile request. Non-blocking; duplicates are skipped.
   void submitRequest(CompileRequest req);
 
+  /// Forward a user symbol to the worker engine for JIT resolution.
+  void addUserSymbol(const std::string &name, void *addr);
+
 private:
   void workerLoop();
   void compileOne(const CompileRequest &req);

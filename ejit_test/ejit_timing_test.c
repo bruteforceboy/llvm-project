@@ -79,22 +79,34 @@ uint32_t cell_nojit(uint8_t ci) {
 
 //===-- 运行时 API -----------------------------------------------------------===//
 
-extern int ejit_init(const void *cfg);
+// ejit_config_t must match EJitRuntime.h layout exactly.
+typedef struct {
+  int compileMode;          // 0=sync, 1=async
+  int optLevel;             // 0=default(L2), 1=L1, 2=L2, 3=L3
+  size_t maxCodeMemory;
+  size_t maxDataMemory;
+  size_t maxCacheEntries;
+  size_t maxCacheSize;
+  bool enableLogger;
+  bool forceStaticRegistry;
+  const char *dumpJITDir;
+} ejit_config_t;
+
+// ejit_stats_t must match EJitRuntime.h layout exactly.
+typedef struct {
+  size_t entryCount;
+  size_t totalCodeSize;
+  size_t maxSize;
+  uint64_t hits;
+  uint64_t misses;
+  uint64_t evictions;
+} ejit_stats_t;
+
+extern int ejit_init(const ejit_config_t *cfg);
 extern int ejit_activate(const char *name, unsigned char idx);
 extern int ejit_deactivate(const char *name, unsigned char idx);
 extern int ejit_is_active(const char *name, unsigned char idx);
 extern void ejit_shutdown(void);
-
-typedef struct {
-  uint32_t entries;
-  uint64_t codeSize;
-  uint64_t maxSize;
-  uint64_t hits;
-  uint64_t misses;
-  uint64_t evictions;
-  uint32_t active;
-} ejit_stats_t;
-
 extern int ejit_get_stats(ejit_stats_t *s);
 
 //===-- 高精度计时 (batch timing, 摊销 clock_gettime 开销) -----------------===//
@@ -201,7 +213,11 @@ int main(int argc, char **argv) {
     g_trp[i].status = 0;
   }
 
-  ejit_init(0);
+  ejit_config_t cfg;
+  memset(&cfg, 0, sizeof(cfg));
+  cfg.compileMode = 1;  // EJIT_COMPILE_ASYNC
+  cfg.optLevel    = 2;  // EJIT_OPT_L2
+  ejit_init(&cfg);
 
   //=== 1. Baseline: plain function call (no EJIT) ===//
   printf("--- [1] Baseline: plain function (no EJIT, %llu iters/batch) ---\n",
@@ -217,23 +233,30 @@ int main(int argc, char **argv) {
     printf("  (precondition OK: cell not yet active)\n");
   batch_call("cell_jit (fallback)", cell_jit, ci, ITERS_LARGE);
 
-  //=== 3. First-call JIT compile (sync) ===//
-  // Activate before timing so JIT compile time is measured cleanly.
+  //=== 3. First-call JIT compile (async) ===//
+  // Activate before timing so async submit latency is measured cleanly.
   ejit_activate("cell", ci);
-  printf("\n--- [3] First-call JIT compile (cold, activate done beforehand) ---\n");
+  printf("\n--- [3] First-call JIT compile (async, activate done beforehand) ---\n");
+  ejit_stats_t s;
   {
     double t0 = now_ns();
-    uint32_t r = cell_jit(ci);
+    uint32_t r = cell_jit(ci);  // queues async compile, returns fallback
     double t1 = now_ns();
-    printf("  first call:  %llu ns  (JIT compile + first call)\n",
+    printf("  first call:  %llu ns  (JIT compile queued, fallback returned)\n",
            (unsigned long long)(uint64_t)(t1 - t0));
     printf("  result=%u\n", r);
+
+    // Spin until background compilation deposits the cache entry.
+    memset(&s, 0, sizeof(s));
+    do { ejit_get_stats(&s); } while (!s.entryCount);
+    double t2 = now_ns();
+    printf("  background compile done: %.2f ms  (total from first call)\n",
+           (t2 - t0) / 1e6);
   }
 
-  ejit_stats_t s;
   ejit_get_stats(&s);
-  printf("  stats: entries=%u hits=%llu misses=%llu\n",
-         s.entries, (unsigned long long)s.hits, (unsigned long long)s.misses);
+  printf("  stats: entries=%zu hits=%llu misses=%llu\n",
+         s.entryCount, (unsigned long long)s.hits, (unsigned long long)s.misses);
 
   //=== 4. Cache hit latency ===//
   printf("\n--- [4] Cache hit path (%llu iters/batch) ---\n",
@@ -241,8 +264,8 @@ int main(int argc, char **argv) {
   batch_call("cell_jit (cache hit)", cell_jit, ci, ITERS_LARGE);
 
   ejit_get_stats(&s);
-  printf("  stats: entries=%u hits=%llu misses=%llu\n\n",
-         s.entries, (unsigned long long)s.hits, (unsigned long long)s.misses);
+  printf("  stats: entries=%zu hits=%llu misses=%llu\n\n",
+         s.entryCount, (unsigned long long)s.hits, (unsigned long long)s.misses);
 
   //=== 5. Multi-dim ===//
   printf("--- [5] Multi-dim (cell+trp, %llu iters/batch) ---\n",
@@ -301,7 +324,7 @@ int main(int argc, char **argv) {
   //=== Summary ===//
   ejit_get_stats(&s);
   printf("\n=== Summary ===\n");
-  printf("  Cache entries:  %u\n", s.entries);
+  printf("  Cache entries:  %zu\n", s.entryCount);
   printf("  Cache hits:     %llu\n", (unsigned long long)s.hits);
   printf("  Cache misses:   %llu\n", (unsigned long long)s.misses);
   printf("  Evictions:      %llu\n", (unsigned long long)s.evictions);

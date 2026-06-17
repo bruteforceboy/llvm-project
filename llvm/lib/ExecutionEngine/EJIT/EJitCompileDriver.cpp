@@ -3,6 +3,7 @@
 #include "llvm/ExecutionEngine/EJIT/EJitCompileDriver.h"
 #include "llvm/ExecutionEngine/EJIT/EJitDiag.h"
 #ifndef EJIT_FREESTANDING
+#include "llvm/ExecutionEngine/EJIT/EJitAsyncCompiler.h"
 #include "llvm/ExecutionEngine/EJIT/EJitLogger.h"
 #endif
 #include "llvm/ExecutionEngine/EJIT/EJitOrcEngine.h"
@@ -31,6 +32,13 @@ EJitCompileDriver::~EJitCompileDriver() = default;
 void EJitCompileDriver::setSyncEngine(std::unique_ptr<EJitOrcEngine> engine) {
   syncEngine_ = std::move(engine);
 }
+
+#ifndef EJIT_FREESTANDING
+void EJitCompileDriver::setAsyncCompiler(
+    std::unique_ptr<EJitAsyncCompiler> compiler) {
+  asyncCompiler_ = std::move(compiler);
+}
+#endif
 
 void EJitCompileDriver::registerSymbol(const std::string &name, void *addr) {
   if (syncEngine_)
@@ -105,6 +113,13 @@ void *EJitCompileDriver::getOrCompile(uint64_t cacheKey) {
   ctx.optLevel = config_.optLevel;
   for (unsigned i = 0; i < dimCount; ++i)
     ctx.dimensions.push_back({periodNames[i], dims[i]});
+
+#ifndef EJIT_FREESTANDING
+  if (asyncCompiler_) {
+    asyncCompiler_->submitRequest({funcName, bitcode.str(), ctx, 0});
+    return nullptr;
+  }
+#endif
 
   if (!syncEngine_) {
     EJIT_DIAG("compile FAIL key=0x%016lx func=%s: no sync engine", cacheKey, funcName.c_str());
