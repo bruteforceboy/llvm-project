@@ -45,6 +45,50 @@ constexpr unsigned char kSrePtNo =
 constexpr unsigned kSreMid = static_cast<unsigned>(EJIT_SRE_CODE_POOL_MID);
 constexpr size_t k2MiB = static_cast<size_t>(2) * 1024 * 1024;
 constexpr size_t k4KiB = static_cast<size_t>(4) * 1024;
+
+#ifdef EJIT_CODE_POOL_NEAR_MAIN
+// ── Near-main code arena ─────────────────────────────────────────────────────
+// When EJIT_CODE_POOL_NEAR_MAIN is set, the code pool draws its backing memory
+// from this arena instead of SRE_MemDbgAlloc. The arena is an ordinary static
+// object linked into the main program image, so every pool — and therefore all
+// JIT-emitted machine code — lands within the image's address span, i.e. within
+// AArch64 direct-branch (±128 MiB) and ADRP (±4 GiB) reach of main's code and
+// the period-array / static globals the JIT references. That lets codegen use
+// cheap PC-relative addressing instead of the far absolute / literal-pool form
+// the Large code model must emit when JITLink's own mmap lands terabytes away.
+//
+// NOTE: near placement alone does not change the emitted instructions — the ORC
+// engine must ALSO drop CodeModel::Large (→ Small/Medium) and stop clearing
+// dso_local for this to translate into cheaper addressing. See EJitOrcEngine.
+//
+// Sizing: the manager requests poolSize + poolAlign per pool (4K-seal slack) and
+// 2 MiB-aligns the base, so we reserve EJIT_CODE_POOL_NEAR_MAIN_POOLS such
+// windows. The arena is 2 MiB-aligned and its size is a whole multiple of 2 MiB,
+// so each pool owns entire 2 MiB regions exclusively — split_2m_to_4k / enable_ex
+// never touch unrelated image data. Exhaustion returns null → the manager
+// surfaces a clean allocation failure and the JIT falls back to the AOT body.
+#ifndef EJIT_CODE_POOL_NEAR_MAIN_POOLS
+#define EJIT_CODE_POOL_NEAR_MAIN_POOLS 2
+#endif
+constexpr size_t kNearMainPools =
+    static_cast<size_t>(EJIT_CODE_POOL_NEAR_MAIN_POOLS);
+constexpr size_t kNearMainArenaBytes =
+    kNearMainPools * (static_cast<size_t>(kSrePoolSize) + k2MiB);
+
+alignas(k2MiB) unsigned char gEJitNearMainArena[kNearMainArenaBytes];
+size_t gEJitNearMainOff = 0;
+
+// Bump-allocate a 2 MiB-aligned window from the arena. Called only from
+// newActivePoolLocked (under the manager lock), so no synchronization needed.
+void *nearMainAlloc(size_t Bytes) {
+  size_t base = (gEJitNearMainOff + (k2MiB - 1)) & ~(k2MiB - 1);
+  if (base < gEJitNearMainOff || base + Bytes < base ||
+      base + Bytes > kNearMainArenaBytes)
+    return nullptr; // exhausted / overflow → clean allocation failure
+  gEJitNearMainOff = base + Bytes;
+  return gEJitNearMainArena + base;
+}
+#endif // EJIT_CODE_POOL_NEAR_MAIN
 } // namespace
 
 //===----------------------------------------------------------------------===//
@@ -88,8 +132,19 @@ llvm::ejit::makeSreCodePoolManager() {
 #endif
 
   auto RawAlloc = [](size_t Bytes) -> void * {
+#ifdef EJIT_CODE_POOL_NEAR_MAIN
+    // Serve from the image-resident arena so JIT code lands within AArch64
+    // PC-relative reach of the main program's code and globals (see above).
+    void *P = nearMainAlloc(Bytes);
+    EJIT_DIAG_VERBOSE("nearMainAlloc(%zu) = %p (arena=%p..%p)", Bytes, P,
+                      static_cast<void *>(gEJitNearMainArena),
+                      static_cast<void *>(gEJitNearMainArena +
+                                          kNearMainArenaBytes));
+    return P;
+#else
     return SRE_MemDbgAlloc(kSreMid, kSrePtNo, static_cast<unsigned long>(Bytes),
                            __func__, __LINE__);
+#endif
   };
 
   auto Seal = [](void *Va) -> unsigned {

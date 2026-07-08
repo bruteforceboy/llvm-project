@@ -142,6 +142,25 @@ if(EJIT_SRE_CODE_POOL AND EJIT_CODE_POOL_4K_SEAL)
   target_compile_definitions(LLVMEJIT PRIVATE EJIT_CODE_POOL_4K_SEAL)
 endif()
 
+# Near-main code placement. When ON, the SRE code pool draws its backing memory
+# from a static, 2 MiB-aligned arena linked into the main program image instead
+# of SRE_MemDbgAlloc, so JIT-emitted code lands within AArch64 PC-relative reach
+# of main's code and globals (see EJitSrePlatform.cpp). Scoped to LLVMEJIT so
+# toggling it only recompiles the runtime. Only meaningful with the SRE code
+# pool enabled. EJIT_CODE_POOL_NEAR_MAIN_POOLS sizes the arena in 2 MiB pools.
+option(EJIT_CODE_POOL_NEAR_MAIN
+  "Allocate the SRE code pool from an in-image arena so JIT code is placed \
+close to the main program (AArch64 PC-relative reach)." OFF)
+set(EJIT_CODE_POOL_NEAR_MAIN_POOLS "2" CACHE STRING
+  "Number of 2 MiB pools reserved in the in-image near-main code arena.")
+if(EJIT_SRE_CODE_POOL AND EJIT_CODE_POOL_NEAR_MAIN)
+  message(STATUS "EmbeddedJIT: near-main code pool arena enabled "
+                 "(${EJIT_CODE_POOL_NEAR_MAIN_POOLS} pools)")
+  target_compile_definitions(LLVMEJIT PRIVATE
+    EJIT_CODE_POOL_NEAR_MAIN
+    EJIT_CODE_POOL_NEAR_MAIN_POOLS=${EJIT_CODE_POOL_NEAR_MAIN_POOLS})
+endif()
+
 # EJIT_FREESTANDING must be visible in LLVMJITLink headers so that
 # std::promise / std::future usage is guarded (bare-metal has no <future>).
 if(EJIT_FREESTANDING)
