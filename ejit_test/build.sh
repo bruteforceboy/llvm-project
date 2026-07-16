@@ -192,6 +192,7 @@ ALL_TESTS=(
   ejit_trace_test
   ejit_volatile_test
   ejit_chain_bench
+  ejit_template_reuse_test
 )
 
 # Per-test compile flags (e.g. for disabling global constructors)
@@ -248,6 +249,7 @@ TEST_ARGS[ejit_baremetal_link_test]="0 3"
 TEST_ARGS[ejit_sync_mode_test]="0"
 TEST_ARGS[ejit_new_attr_test]="0"
 TEST_ARGS[ejit_fixed_dim_test]="0 1"
+TEST_ARGS[ejit_template_reuse_test]=""
 TEST_ARGS[ejit_chain_bench]=""
 
 if [[ ${#SELECTED[@]} -eq 0 ]]; then
