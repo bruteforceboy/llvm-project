@@ -25,6 +25,7 @@ namespace ejit {
 class PeriodArrayRegistry;
 class EJitRuntimeState;
 struct EJitSharedTaskPoolState;
+struct PreloadedBitcode;
 
 /// Set a function-name filter for JIT IR+ASM diagnostic capture. When non-
 /// empty, the engine captures (saves in memory) the post-optimization IR and
@@ -70,6 +71,17 @@ public:
          PeriodArrayRegistry &periodReg,
          EJitRuntimeState &runtimeState);
 
+  /// Pre-parse \p bitcodeData and cache everything loadBitcodeModule() would
+  /// otherwise recompute for every specialization built from the same blob:
+  /// the parsed module (kept as a template that is cloned per compile) and the
+  /// external function/global declarations needing symbol resolution.
+  ///
+  /// Purely an optimization — loadBitcodeModule() warms the same cache lazily
+  /// on its first call for a blob. Calling this ahead of time moves that
+  /// one-off cost (the dominant part of loadBitcodeModule) off the first
+  /// compile. Idempotent; safe to call repeatedly for the same blob.
+  Error preLoadBitcodeUtil(StringRef bitcodeData);
+
   /// Load a bitcode module into a per-specialization JITDylib identified
   /// by cacheKey. Each specialization gets its own JITDylib so symbols
   /// from the same TU bitcode can be defined multiple times without conflict.
@@ -105,6 +117,11 @@ public:
 #endif
 
 private:
+  /// Parse \p bitcodeData and install the derived template + symbol
+  /// scaffolding in the per-blob cache, replacing any existing entry.
+  /// Returns a pointer into the cache, valid until the entry is replaced.
+  Expected<PreloadedBitcode *> buildPreloadedBitcode(StringRef bitcodeData);
+
   struct Impl;
   std::unique_ptr<Impl> P;
 };
