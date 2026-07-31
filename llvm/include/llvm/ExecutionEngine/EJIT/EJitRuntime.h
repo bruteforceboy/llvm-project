@@ -166,6 +166,18 @@ void ejit_register_funcindex(const char *funcName, uint32_t *slotOut);
 void ejit_register_icache_slot(const char *funcName, void *slot,
                                uint32_t numDims);
 
+// Bring the CALLING core's inline cache up to date, dropping every cached
+// specialization if a period toggled since this core last synced. Cheap when
+// nothing changed (one shared load); a no-op when the inline cache is not used.
+//
+// Cells are core-private, so ejit_deactivate only drains the core it runs on.
+// The runtime also syncs a core whenever it resolves through the taskpool, which
+// covers any core with a cold cell. A core whose cells are ALL warm never enters
+// the runtime and so never observes the toggle: such a core must call this
+// itself, once per period boundary, or it keeps running specializations built
+// for the previous period values.
+void ejit_icache_sync(void);
+
 // Lifecycle. Activation is keyed by lifecycle/period name + instance index
 // only; there is no array-pointer dimension in the active state (a period name
 // with multiple arrays is activated as a whole for that instance).

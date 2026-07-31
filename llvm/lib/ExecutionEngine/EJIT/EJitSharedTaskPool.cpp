@@ -155,6 +155,20 @@ struct EJitIcacheSlotReg {
 };
 EJitIcacheSlotReg gIcacheSlots[EJIT_ICACHE_FUNC_SLOTS];
 
+// This core's view of the shared icacheEpoch, and the blob it was taken from.
+// Core-private like the cells themselves (default BSS, zero-filled). The state
+// pointer is part of the key because a fresh blob restarts the epoch from 0,
+// which a stale seen-epoch could match by coincidence.
+uint32_t gIcacheSeenEpoch = 0;
+const void *gIcacheSeenState = nullptr;
+
+uintptr_t icacheCellCount(uint32_t numDims) {
+  uintptr_t n = 1;
+  for (uint32_t i = 0; i < numDims; ++i)
+    n *= EJIT_ICACHE_DIM_SIZE;
+  return n;
+}
+
 // Linearize the dim identity to a flat cell index, row-major, dim0 = leftmost
 // ejit_dim param (MUST match the AOT [D]^numDims array declaration order). D is
 // EJIT_ICACHE_DIM_SIZE (power-of-2). numDims=0 -> idx 0 (the scalar cell). No
@@ -172,6 +186,14 @@ void llvm::ejit::ejitIcacheRegisterSlot(uint32_t funcIndex, void *base,
                                         uint32_t numDims) {
   if (funcIndex >= EJIT_ICACHE_FUNC_SLOTS || !base)
     return;
+  // numDims sizes the [D]^numDims cell array the drain walks, so an out-of-cap
+  // value is a write far past the end of the wrapper's global. The AOT pass
+  // never emits one (it skips entries above the cap), but numDims arrives here
+  // from a uint64 registry field and from the public C ABI, so reject it rather
+  // than trust it. Leaving the slot unregistered is the documented safe
+  // degradation: probes miss and the taskpool serves every call.
+  if (numDims > EJIT_ICACHE_MAX_DIMS)
+    return;
   gIcacheSlots[funcIndex].base = reinterpret_cast<uintptr_t *>(base);
   gIcacheSlots[funcIndex].numDims = numDims;
 }
@@ -187,6 +209,52 @@ void llvm::ejit::ejitIcacheClearAll() {
     gIcacheSlots[f].base = nullptr;
     gIcacheSlots[f].numDims = 0;
   }
+  gIcacheSeenEpoch = 0;
+  gIcacheSeenState = nullptr;
+}
+
+// Zero every registered cell array, so every probe misses and the next call
+// re-resolves through the taskpool. The bases stay registered (unlike
+// ejitIcacheClearAll); the wrapper globals are only emptied. Safe against a
+// concurrent wrapper on this core: a probe that already loaded a pointer keeps
+// running it (code is never freed under the gate this cache requires), so
+// zeroing only affects subsequent probes.
+static void icacheDrainCells() {
+  for (uint32_t f = 0; f < EJIT_ICACHE_FUNC_SLOTS; ++f) {
+    EJitIcacheSlotReg &reg = gIcacheSlots[f];
+    if (!reg.base)
+      continue;
+    if (reg.numDims > EJIT_ICACHE_MAX_DIMS)
+      continue; // defence in depth: never walk past a mis-sized array
+    const uintptr_t cells = icacheCellCount(reg.numDims);
+    for (uintptr_t c = 0; c < cells; ++c)
+      reg.base[c] = 0;
+  }
+}
+
+bool EJitSharedTaskPool::icacheSyncEpoch() {
+  if (!state_)
+    return false;
+  // Read the epoch BEFORE draining, so a toggle racing this drain leaves the
+  // seen-epoch behind (one more drain later), never ahead (a missed drain).
+  const uint32_t epoch = state_->icacheEpoch.loadAcquire();
+  if (gIcacheSeenState == state_ && gIcacheSeenEpoch == epoch)
+    return false;
+  icacheDrainCells();
+  gIcacheSeenEpoch = epoch;
+  gIcacheSeenState = state_;
+  return true;
+}
+
+// True when this core's cells are still valid under the CURRENT shared epoch.
+// The taskpool entry point syncs (setting the seen-epoch) before resolving, so a
+// toggle landing during the resolve makes this false and the fill is dropped --
+// without it the fill would store a pointer specialized for the pre-toggle
+// period values and no later sync would notice, because the seen-epoch was
+// already brought up to date.
+static bool icacheEpochCurrent(const EJitSharedTaskPoolState *state) {
+  return state && gIcacheSeenState == state &&
+         gIcacheSeenEpoch == state->icacheEpoch.loadAcquire();
 }
 
 void llvm::ejit::ejitDumpIcacheSlots() {
@@ -373,12 +441,14 @@ void EJitSharedTaskPool::icacheFill(uint32_t funcIndex, void *fnPtr,
               funcIndex, (void *)reg.base, reg.numDims, numDims);
     return; // unregistered, or shape mismatch: nowhere to write.
   }
+  // A period toggled between this core's pre-resolve sync and now, so fnPtr may
+  // be specialized for the old values: drop it and let the next call re-resolve.
+  if (!icacheEpochCurrent(state_))
+    return;
   // Plain store: the slot is per-core private, so this write (on the calling
   // core) is ordered before the wrapper's read (same core) by program order.
-  // The specialization is invariant per identity under the contract + NO_RECLAIM,
-  // so overwriting on a later resolve (same pointer) is harmless -- no one-shot
-  // CAS is needed. No atomic/release: same-core, and the read's data dependency
-  // on the pointer orders this store-before-use.
+  // No atomic/release: same-core, and the read's data dependency on the pointer
+  // orders this store-before-use.
   uintptr_t idx = icacheLinearize(dims, numDims);
   reg.base[idx] = reinterpret_cast<uintptr_t>(fnPtr);
   EJIT_DIAG("icacheFill OK func=%u dims=%u idx=%zu fn=%p cell[0]=%p",
@@ -430,8 +500,10 @@ bool EJitSharedTaskPool::setInstanceEnabled(uint32_t dimType,
   uint8_t desired = enabled ? 1 : 0;
   if (state_->enabled[dimType][instanceId].compareExchange(expected, desired)) {
     state_->version[dimType][instanceId].fetchAdd(1);
-    // Cached L0 entries carry no version, so retire them all.
+    // Neither the L0 nor the inline cache stores a version, so the bump above
+    // is invisible to both: each has its own epoch to drain against.
     state_->dispatchEpoch.fetchAdd(1);
+    state_->icacheEpoch.fetchAdd(1);
     // Latch on the first successful enable of ANY instance: this brackets the
     // init→activate window during which instanceDisabled hits are tallied
     // separately (instanceDisabledPreActivate) for diagnosing the pre-activate
@@ -1735,6 +1807,10 @@ void EJitSharedTaskPool::ownerShutdown() {
   state_->ownerCoreId.storeRelease(kEJitInvalidCoreId);
   state_->workerTaskId.storeRelease(0);
   state_->generation.storeRelease(state_->generation.loadRelaxed() + 1);
+  // Retire every core's inline cache: a re-initialization reuses this blob, so
+  // the epoch (not the blob address) is the only thing that can tell a core its
+  // cells point into the previous generation's code.
+  state_->icacheEpoch.fetchAdd(1);
   state_->initState.storeRelease(
       static_cast<uint32_t>(EJitSharedInitState::Uninitialized));
   isOwner_ = false;

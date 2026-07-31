@@ -84,16 +84,17 @@ enum class EJitWorkerStep : uint32_t {
 //===----------------------------------------------------------------------===//
 // Per-function inline cache (v2: sticky monomorphic).
 //
-// A single global slot per funcIndex holding a FROZEN specialization pointer:
-// written once (first resolution, one-shot CAS) and read forever. No version /
-// dims / generation re-validation, no refill, and no release_read on the hit
-// path - the probe is a single acquire load + null check.
+// A cell per (funcIndex, dim identity) holding a specialization pointer, read
+// with no version / dims / generation re-validation and no release_read - the
+// probe is a single load + null check.
 //
-// Correctness rests on a hard precondition: every ejit_entry's specialization
-// is invariant for process lifetime (period toggles do not change the baked
-// code; each entry is monomorphic - always called with one dim identity). If
-// that ever fails the cache silently runs a stale specialization; the safety
-// gate below does NOT cover that, only UAF.
+// A cell therefore cannot be invalidated in place. Instead an activate or
+// deactivate bumps the shared icacheEpoch, and each core drains its whole table
+// when it next observes a change (icacheSyncEpoch). Cells are core-private, so
+// the toggling core cannot reach a peer's table; publishing an epoch and
+// observing it per core is what makes the invalidation cross-core. A core that
+// only ever hits never reaches a sync point and must call ejit_icache_sync()
+// itself - see that declaration.
 //
 // Lifetime safety: JIT code is never physically freed in production (NO_RECLAIM
 // + no releaseFn_ wired), so a cached pointer can never dangle. v2 does NO
@@ -664,8 +665,26 @@ public:
   /// those bypass cachePublish() and setInstanceEnabled().
   void retireDispatchCache();
 
+  //
+  // Requires the caller to have run icacheSyncEpoch() before resolving fnPtr:
+  // the fill is DROPPED if the epoch moved since, because fnPtr may then be
+  // specialized for the pre-toggle period values.
   void icacheFill(uint32_t funcIndex, void *fnPtr, const EJitDimPair *dims,
                   uint32_t numDims);
+
+  /// Bring THIS core's inline cache up to date with the shared icacheEpoch,
+  /// draining every cell if a period toggled since this core last synced.
+  /// Returns true if a drain occurred. Also drains when this core last synced
+  /// against a DIFFERENT blob, which the epoch alone cannot catch: a fresh blob
+  /// restarts from a low epoch a stale seen-epoch can match by coincidence.
+  ///
+  /// Draining is all-or-nothing: toggles are rare, so the refill is paid once
+  /// per toggle rather than adding a check to the hit path.
+  ///
+  /// Called from ejit_deactivate (the toggling core) and at compile_or_get
+  /// entry, before any bucket lock is taken - a drain must never run under a
+  /// read token.
+  bool icacheSyncEpoch();
 
   //--- consumer path (worker / test) -----------------------------------------
   bool pollOne();

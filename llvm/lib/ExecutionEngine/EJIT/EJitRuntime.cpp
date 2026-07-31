@@ -386,6 +386,22 @@ void ejit_register_icache_slot(const char *funcName, void *slot,
                     funcName, idx, numDims);
 }
 
+namespace {
+// Drain THIS core's inline cache if a period toggled since it last synced.
+// A no-op in a non-shared build. Must run before any bucket lock is taken.
+inline void ejitIcacheSyncThisCore() {
+#ifdef EJIT_SRE_SHARED_TASKPOOL
+  if (EJitSharedTaskPool *sp = gEJIT ? gEJIT->sharedTaskPool() : nullptr) {
+    if (sp->icacheSyncEpoch())
+      EJIT_DIAG("icache drained on core %u (period toggle)",
+                EJitCoreId::current());
+  }
+#endif
+}
+} // namespace
+
+void ejit_icache_sync(void) { ejitIcacheSyncThisCore(); }
+
 ejit_status_t ejit_activate(const char *periodName, uint8_t cellIdx) {
   if (!gEJIT) {
     EJIT_DIAG("activate(%s,%u) failed: not initialized", periodName, cellIdx);
@@ -409,6 +425,7 @@ ejit_status_t ejit_deactivate(const char *periodName, uint8_t cellIdx) {
   if (!gEJIT->deactivate(periodName, cellIdx))
     return EJIT_ERR_INVALID_PARAM; // unknown lifecycle: nothing changed.
   gEJIT->invalidateByPeriod(periodName, cellIdx);
+  ejitIcacheSyncThisCore();
   return EJIT_OK;
 }
 
@@ -432,6 +449,7 @@ ejit_status_t ejit_deactivate_all(const char *periodName) {
   if (!gEJIT->deactivateAll(periodName))
     return EJIT_ERR_INVALID_PARAM;
   gEJIT->invalidateAllByPeriod(periodName);
+  ejitIcacheSyncThisCore();
   return EJIT_OK;
 }
 
@@ -570,6 +588,9 @@ inline void ejitIcacheFillOnSuccess(uint32_t funcIndex, void *fnPtr,
     EJIT_DIAG("icacheFillOnSuccess SKIP func=%u: fnPtr is null", funcIndex);
     return;
   }
+  // Called with the caller's bucket read token held, so this must stay a single
+  // store. The epoch sync runs at compile_or_get entry instead, before any
+  // taskpool lock is taken; icacheFill itself drops a fill that a toggle raced.
   EJitSharedTaskPool *sp = gEJIT ? gEJIT->sharedTaskPool() : nullptr;
   if (!sp) {
     EJIT_DIAG("icacheFillOnSuccess SKIP func=%u: no shared pool (gEJIT=%p)",
@@ -607,6 +628,7 @@ ejit_status_t ejit_taskpool_compile_or_get(uint32_t funcIndex,
     EJIT_DIAG("taskpool_compile_or_get reject func=%u: no taskpool", funcIndex);
     return EJIT_ERR_NOT_ACTIVE;
   }
+  ejitIcacheSyncThisCore();
 
   if (numDims > 4) {
     EJIT_DIAG("taskpool_compile_or_get reject func=%u: numDims=%u > 4",
@@ -709,6 +731,7 @@ ejit_status_t ejit_taskpool_compile_or_get_0d(uint32_t funcIndex, void **outFn,
   auto *tp = activeTaskPool();
   if (!tp)
     return EJIT_ERR_NOT_ACTIVE;
+  ejitIcacheSyncThisCore();
 
   void *l0Fn = nullptr;
   if (tp->l0Try(funcIndex, nullptr, 0, &l0Fn)) {
@@ -748,6 +771,7 @@ ejit_status_t ejit_taskpool_compile_or_get_1d(uint32_t funcIndex, uint32_t dim0,
   auto *tp = activeTaskPool();
   if (!tp)
     return EJIT_ERR_NOT_ACTIVE;
+  ejitIcacheSyncThisCore();
   if (!ejitTaskpoolDimInRange(dim0, inst0))
     return EJIT_ERR_INVALID_PARAM;
 
@@ -797,6 +821,7 @@ ejit_status_t ejit_taskpool_compile_or_get_2d(uint32_t funcIndex, uint32_t dim0,
   auto *tp = activeTaskPool();
   if (!tp)
     return EJIT_ERR_NOT_ACTIVE;
+  ejitIcacheSyncThisCore();
   if (!ejitTaskpoolDimInRange(dim0, inst0) ||
       !ejitTaskpoolDimInRange(dim1, inst1))
     return EJIT_ERR_INVALID_PARAM;
@@ -844,6 +869,7 @@ ejit_status_t ejit_taskpool_compile_or_get_3d(uint32_t funcIndex, uint32_t dim0,
   auto *tp = activeTaskPool();
   if (!tp)
     return EJIT_ERR_NOT_ACTIVE;
+  ejitIcacheSyncThisCore();
   if (!ejitTaskpoolDimInRange(dim0, inst0) ||
       !ejitTaskpoolDimInRange(dim1, inst1) ||
       !ejitTaskpoolDimInRange(dim2, inst2))
@@ -894,6 +920,7 @@ ejit_status_t ejit_taskpool_compile_or_get_4d(uint32_t funcIndex, uint32_t dim0,
   auto *tp = activeTaskPool();
   if (!tp)
     return EJIT_ERR_NOT_ACTIVE;
+  ejitIcacheSyncThisCore();
   if (!ejitTaskpoolDimInRange(dim0, inst0) ||
       !ejitTaskpoolDimInRange(dim1, inst1) ||
       !ejitTaskpoolDimInRange(dim2, inst2) ||

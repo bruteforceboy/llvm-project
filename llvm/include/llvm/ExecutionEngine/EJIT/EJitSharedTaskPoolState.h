@@ -343,6 +343,13 @@ struct alignas(kEJitSharedCacheLine) EJitSharedTaskPoolState {
       EJitAtomicU8 enabled[kEJitSharedDimTypes][kEJitSharedInstances];
   EJitAtomicU32 version[kEJitSharedDimTypes][kEJitSharedInstances];
   EJitAtomicU32 mode; ///< EJitCompileMode (Off=0, Async=1)
+  EJitAtomicU32 icacheEpoch; ///< bumped by every setInstanceEnabled transition.
+                             ///< The inline cache stores a bare fnPtr with no
+                             ///< version, so an activate/deactivate cannot
+                             ///< invalidate individual cells; each core instead
+                             ///< compares this against its private seen-epoch
+                             ///< and drains its whole table when they diverge
+                             ///< (icacheSyncEpoch). Bumped, never reset.
   EJitAtomicU32 anyInstanceActivated; ///< 1 once any instance first
                                       ///< setInstanceEnabled(true); gates the
                                       ///< instanceDisabledPreActivate counter.
