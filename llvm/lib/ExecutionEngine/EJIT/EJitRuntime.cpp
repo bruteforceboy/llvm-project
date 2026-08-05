@@ -388,7 +388,9 @@ void ejit_register_icache_slot(const char *funcName, void *slot,
 
 namespace {
 // Drain THIS core's inline cache if a period toggled since it last synced.
-// A no-op in a non-shared build. Must run before any bucket lock is taken.
+// Reached from the taskpool entry points, i.e. the miss path -- which is where
+// the probe sends a call once it sees the shared epoch move. No-op in a
+// non-shared build. Must run before any bucket lock is taken.
 inline void ejitIcacheSyncThisCore() {
 #ifdef EJIT_SRE_SHARED_TASKPOOL
   if (EJitSharedTaskPool *sp = gEJIT ? gEJIT->sharedTaskPool() : nullptr) {
@@ -425,7 +427,6 @@ ejit_status_t ejit_deactivate(const char *periodName, uint8_t cellIdx) {
   if (!gEJIT->deactivate(periodName, cellIdx))
     return EJIT_ERR_INVALID_PARAM; // unknown lifecycle: nothing changed.
   gEJIT->invalidateByPeriod(periodName, cellIdx);
-  ejitIcacheSyncThisCore();
   return EJIT_OK;
 }
 
@@ -449,7 +450,6 @@ ejit_status_t ejit_deactivate_all(const char *periodName) {
   if (!gEJIT->deactivateAll(periodName))
     return EJIT_ERR_INVALID_PARAM;
   gEJIT->invalidateAllByPeriod(periodName);
-  ejitIcacheSyncThisCore();
   return EJIT_OK;
 }
 

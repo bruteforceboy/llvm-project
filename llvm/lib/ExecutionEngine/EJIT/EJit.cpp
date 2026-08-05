@@ -216,6 +216,29 @@ EJit::EJit(const Config &config) : config_(config) {
             break;
           }
           uint32_t numDims = static_cast<uint32_t>(e->size);
+          // High 32 bits carry the probe contract version (kEJitIcacheProbeAbi).
+          // An object built before the stamp existed reports 0.
+          uint32_t probeAbi = static_cast<uint32_t>(e->size >> 32);
+          if (probeAbi < kEJitIcacheProbeAbi) {
+            // This probe cannot observe a period toggle: it has no shared-epoch
+            // check, so a core that only ever hits would keep calling a
+            // specialization built for the previous period values -- silently,
+            // forever. Leave the slot UNREGISTERED. The cell then stays null,
+            // every call misses to the taskpool, and results stay correct; only
+            // the fast path is lost. Far better than running quietly wrong.
+            EJIT_DIAG("icache DISABLED for %s: probe ABI %u < %u (object "
+                      "predates the shared-epoch check -- rebuild it with THIS "
+                      "clang; the runtime alone is not enough)",
+                      e->name1, probeAbi,
+                      static_cast<unsigned>(kEJitIcacheProbeAbi));
+            break;
+          }
+          // name2 carries the probe's epoch window (see
+          // ejitIcacheBindEpochWindow). Binding by address is what guarantees
+          // the runtime writes the bytes the probe reads.
+          if (e->name2)
+            ejitIcacheBindEpochWindow(
+                const_cast<void *>(static_cast<const void *>(e->name2)));
           uint32_t idx = EJitFuncRegistry::instance().resolveAssign(e->name1);
           if (idx != kEJitInvalidFuncIndex)
             ejitIcacheRegisterSlot(idx, const_cast<void *>(e->ptr), numDims);

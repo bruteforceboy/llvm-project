@@ -90,11 +90,14 @@ enum class EJitWorkerStep : uint32_t {
 //
 // A cell therefore cannot be invalidated in place. Instead an activate or
 // deactivate bumps the shared icacheEpoch, and each core drains its whole table
-// when it next observes a change (icacheSyncEpoch). Cells are core-private, so
-// the toggling core cannot reach a peer's table; publishing an epoch and
-// observing it per core is what makes the invalidation cross-core. A core that
-// only ever hits never reaches a sync point and must call ejit_icache_sync()
-// itself - see that declaration.
+// when it observes a change (icacheSyncEpoch). Cells are core-private, so the
+// toggling core cannot reach a peer's table; publishing an epoch and having
+// each core observe it is what makes the invalidation cross-core.
+//
+// The probe itself checks that epoch on every call (see EJitIcacheEpochRef), so
+// a core discovers a toggle even if it never misses and never reaches any other
+// sync point. ejit_icache_sync() remains available but is no longer required
+// for correctness.
 //
 // Lifetime safety: JIT code is never physically freed in production (NO_RECLAIM
 // + no releaseFn_ wired), so a cached pointer can never dangle. v2 does NO
@@ -125,6 +128,40 @@ enum class EJitWorkerStep : uint32_t {
 #ifndef EJIT_ICACHE_MAX_DIMS
 #define EJIT_ICACHE_MAX_DIMS 4u
 #endif
+
+//===----------------------------------------------------------------------===//
+// Probe-visible epoch reference: core-private storage, shared target.
+//
+// The probe compares `seen` against `*shared` on every call. Cells are
+// core-private .bss, so a toggling core cannot reach a peer's table -- it can
+// only publish. Having the READER consult shared memory inverts that, so a core
+// that always hits still observes the toggle without cooperating.
+//
+// `shared` is bound when the pool binds its state, and is null before that. The
+// probe checks the cell FIRST: a non-null cell implies a fill, hence
+// registration, hence `shared` is bound -- so no null check is needed.
+//
+// Both loads are plain: a stale read costs at most one more call into the
+// previous specialization, the same window a racing drain already has.
+//===----------------------------------------------------------------------===//
+struct EJitIcacheEpochRef {
+  /// Epoch this core last drained at. 64-bit purely so it pairs with `shared`
+  /// in one ldp -- the value itself is the 32-bit icacheEpoch.
+  uint64_t seen;
+  const uint32_t *shared; ///< -> blob icacheEpoch; null until the pool binds
+};
+
+/// Bind the probe's epoch window. \p window is the address of the AOT-emitted
+/// @__ejit_icache_epoch, handed over at registration (name2 of the icache
+/// entry) exactly like a cell array base.
+///
+/// The runtime deliberately does NOT define that symbol. If it did, the probe's
+/// reference and the runtime's definition would have to be matched up by the
+/// linker, and any mismatch (visibility, GOT, a copy relocation) would leave
+/// them on different storage -- silently, because a zeroed window reads
+/// seen == *shared == 0, i.e. "always fresh", and every core keeps hitting a
+/// stale cell. Binding by address makes them the same bytes by construction.
+void ejitIcacheBindEpochWindow(void *window);
 
 // Test/diagnostic: clear every icache slot. The slot-pointer table is
 // process-static storage shared across pool instances, so tests clear it

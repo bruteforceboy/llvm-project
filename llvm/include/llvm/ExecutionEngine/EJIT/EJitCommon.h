@@ -88,6 +88,21 @@ constexpr const char *FN_REGISTER_FUNCINDEX = "ejit_register_funcindex";
 // ejit_icache_try call - so the hit path is one load + null-check + indirect
 // call. Signature: void ejit_register_icache_slot(const char *name, void *slot).
 constexpr const char *FN_REGISTER_ICACHE_SLOT = "ejit_register_icache_slot";
+
+// Contract version between the AOT-emitted inline-cache probe and the runtime.
+// Bumped whenever the probe's obligations change, and stamped into the high 32
+// bits of the static-registry `size` field (the low 32 carry numDims, which is
+// <= 4) so a mismatch is detected at init instead of silently mis-executing.
+//
+//   1 = cell load + null check only. Invalidation depends entirely on the
+//       core reaching a sync point, so a core that only ever hits runs a stale
+//       specialization forever.
+//   2 = adds the shared-epoch freshness check (see EJitIcacheEpochRef).
+//
+// An object built by an older clang reports 0 in those bits; the runtime treats
+// anything < kEJitIcacheProbeAbi as "this build cannot invalidate a hot core"
+// and says so loudly at init rather than running quietly wrong.
+constexpr uint32_t kEJitIcacheProbeAbi = 2;
 constexpr const char *FN_TASKPOOL_COMPILE_OR_GET =
     "ejit_taskpool_compile_or_get";
 // Fixed-dimension fast-path C ABI entries (0-4 dims), emitted by the wrapper

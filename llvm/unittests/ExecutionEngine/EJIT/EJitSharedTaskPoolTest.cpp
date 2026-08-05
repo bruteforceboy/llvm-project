@@ -3711,4 +3711,94 @@ TEST_F(SharedTaskPoolTest, InlineCacheResolveFillSurvivesAPendingDrain) {
   ejitIcacheClearAll();
 }
 
+//===----------------------------------------------------------------------===//
+// __ejit_icache_epoch: the window the AOT probe reads on every call.
+//
+// These assert the CONDITION the probe evaluates (seen == *shared), not
+// icacheTry -- icacheTry models a raw cell read and deliberately does not check
+// the epoch, because it stands in for the cell load alone.
+//===----------------------------------------------------------------------===//
+TEST_F(SharedTaskPoolTest, IcacheEpochRefIsBoundBySync) {
+  ejitIcacheClearAll();
+  // Stand in for the AOT-emitted @__ejit_icache_epoch: the runtime writes
+  // through the address it is given, so the test can watch the exact bytes a
+  // probe would read.
+  EJitIcacheEpochRef window{};
+  ejitIcacheBindEpochWindow(&window);
+  EJitSharedTaskPool pool;
+  bringUpOwner(pool);
+
+  pool.icacheSyncEpoch();
+
+  // Bound at the blob's epoch word: this is what lets the probe observe a
+  // toggle performed by a core that cannot reach this core's cells.
+  ASSERT_EQ(window.shared, pool.state()->icacheEpoch.raw());
+  EXPECT_EQ(window.seen, *window.shared)
+      << "probe would take the miss path with nothing having changed";
+
+  ejitIcacheBindEpochWindow(nullptr);
+  ejitIcacheClearAll();
+}
+
+// The window the runtime writes MUST be the one the probe reads. Binding by
+// address is what guarantees it; this pins that contract.
+TEST_F(SharedTaskPoolTest, IcacheEpochWindowIsTheBoundObject) {
+  ejitIcacheClearAll();
+  EJitIcacheEpochRef windowA{}, windowB{};
+  ejitIcacheBindEpochWindow(&windowA);
+  EJitSharedTaskPool pool;
+  bringUpOwner(pool);
+  pool.icacheSyncEpoch();
+  ASSERT_NE(windowA.shared, nullptr);
+
+  // Rebinding moves every subsequent publish to the new object, and the old one
+  // is left untouched -- an unbound/stale window never silently keeps updating.
+  const uint64_t staleSeen = windowA.seen;
+  ejitIcacheBindEpochWindow(&windowB);
+  ASSERT_TRUE(pool.setInstanceEnabled(0, 3, true));
+  EXPECT_TRUE(pool.icacheSyncEpoch());
+  EXPECT_EQ(windowA.seen, staleSeen) << "unbound window still being written";
+  EXPECT_EQ(windowB.seen, *windowB.shared);
+
+  ejitIcacheBindEpochWindow(nullptr);
+  ejitIcacheClearAll();
+}
+
+TEST_F(SharedTaskPoolTest, IcacheEpochRefDivergesOnToggleWithoutAnySync) {
+  ejitIcacheClearAll();
+  EJitIcacheEpochRef window{};
+  ejitIcacheBindEpochWindow(&window);
+  EJitSharedTaskPool pool;
+  bringUpOwner(pool);
+  constexpr uint32_t kFunc = 11;
+  uintptr_t slot = 0;
+  ejitIcacheRegisterSlot(kFunc, &slot, 0);
+
+  pool.icacheSyncEpoch();
+  pool.icacheFill(kFunc, codeFor(kFunc), nullptr, 0);
+  ASSERT_NE(slot, 0u); // warm: this core would now hit forever
+
+  // Steady state: probe passes, so a hit dispatches.
+  ASSERT_EQ(window.seen, *window.shared);
+
+  // A toggle on ANOTHER core. This core does NOT sync -- it is the "always
+  // hits, never enters the runtime" case the drain alone cannot reach.
+  ASSERT_TRUE(pool.setInstanceEnabled(0, 7, true));
+
+  // The cell is still warm (nothing drained it) ...
+  EXPECT_NE(slot, 0u);
+  // ... but the probe's comparison now FAILS, so the call takes the miss path
+  // and gets drained there. This is the whole point of the shared epoch.
+  EXPECT_NE(window.seen, *window.shared)
+      << "a core that only ever hits would keep running the old specialization";
+
+  // Taking the miss path drains and re-arms: the probe passes again.
+  EXPECT_TRUE(pool.icacheSyncEpoch());
+  EXPECT_EQ(slot, 0u);
+  EXPECT_EQ(window.seen, *window.shared);
+
+  ejitIcacheBindEpochWindow(nullptr);
+  ejitIcacheClearAll();
+}
+
 } // namespace

@@ -155,12 +155,20 @@ struct EJitIcacheSlotReg {
 };
 EJitIcacheSlotReg gIcacheSlots[EJIT_ICACHE_FUNC_SLOTS];
 
-// This core's view of the shared icacheEpoch, and the blob it was taken from.
-// Core-private like the cells themselves (default BSS, zero-filled). The state
-// pointer is part of the key because a fresh blob restarts the epoch from 0,
-// which a stale seen-epoch could match by coincidence.
-uint32_t gIcacheSeenEpoch = 0;
+// The blob this core's seen-epoch was taken from. Part of the key because a
+// fresh blob restarts the epoch at 0, which a stale seen-epoch could match by
+// coincidence. Core-private like the cells (default BSS, zero-filled).
+//
+// The authoritative seen-epoch is gIcacheSeenEpoch below; it is mirrored into
+// the probe's window (gProbeEpoch) so the inline probe can read it without a
+// call. See ejitIcacheBindEpochWindow for why the window is owned by the AOT
+// object rather than defined here.
 const void *gIcacheSeenState = nullptr;
+uint32_t gIcacheSeenEpoch = 0;
+
+// The probe's window, owned by the AOT object and registered by address (see
+// ejitIcacheBindEpochWindow). Core-private like everything else here.
+EJitIcacheEpochRef *gProbeEpoch = nullptr;
 
 uintptr_t icacheCellCount(uint32_t numDims) {
   uintptr_t n = 1;
@@ -181,6 +189,14 @@ static uintptr_t icacheLinearize(const EJitDimPair *dims, uint32_t numDims) {
 }
 
 } // namespace
+
+// Probe-visible epoch reference. Core-private BSS: `seen` is this core's last
+// drained epoch, `shared` points into the blob so the probe can observe a peer's
+// toggle without that peer being able to reach this core's cells.
+void llvm::ejit::ejitIcacheBindEpochWindow(void *window) {
+  gProbeEpoch = static_cast<EJitIcacheEpochRef *>(window);
+  EJIT_DIAG_VERBOSE("icache epoch window bound: %p", window);
+}
 
 void llvm::ejit::ejitIcacheRegisterSlot(uint32_t funcIndex, void *base,
                                         uint32_t numDims) {
@@ -210,6 +226,8 @@ void llvm::ejit::ejitIcacheClearAll() {
     gIcacheSlots[f].numDims = 0;
   }
   gIcacheSeenEpoch = 0;
+  if (gProbeEpoch)
+    gProbeEpoch->seen = 0;
   gIcacheSeenState = nullptr;
 }
 
@@ -238,10 +256,20 @@ bool EJitSharedTaskPool::icacheSyncEpoch() {
   // Read the epoch BEFORE draining, so a toggle racing this drain leaves the
   // seen-epoch behind (one more drain later), never ahead (a missed drain).
   const uint32_t epoch = state_->icacheEpoch.loadAcquire();
+  // Bind the probe's window onto the shared word. Done here because every fill
+  // is preceded by a sync on the same core, so a cell can never become non-null
+  // while `shared` is still null -- which is exactly what lets the probe skip a
+  // null check and read the epoch only after the cell tests non-null.
+  if (gProbeEpoch)
+    gProbeEpoch->shared = state_->icacheEpoch.raw();
   if (gIcacheSeenState == state_ && gIcacheSeenEpoch == epoch)
     return false;
   icacheDrainCells();
   gIcacheSeenEpoch = epoch;
+  // Publish LAST: until this store lands the probe still sees the old epoch and
+  // keeps missing, which is the safe direction.
+  if (gProbeEpoch)
+    gProbeEpoch->seen = epoch;
   gIcacheSeenState = state_;
   return true;
 }

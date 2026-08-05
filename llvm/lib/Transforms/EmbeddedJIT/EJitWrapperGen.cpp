@@ -282,6 +282,54 @@ static GlobalVariable *getOrCreateIcacheFnGlobal(Module &M,
   return GV;
 }
 
+// The probe's epoch window: { i64 seen, ptr shared }, DEFINED here.
+//
+// Owned by the AOT object, like the @__ejit_icache_fn_ cells, and for the same
+// reason: the probe must read the very bytes the runtime writes. Declaring it
+// extern and letting the linker match it up invites the two to land on
+// different storage (visibility, GOT, copy relocations), and the failure is
+// silent -- a zeroed window reads seen == *shared == 0, i.e. "always fresh",
+// so every core keeps hitting a stale cell.
+//
+// linkonce_odr: every TU with a probe emits one; the linker keeps a single
+// copy. Ordinary .bss, so it is core-private exactly like the cells. The
+// runtime is handed this address at registration (name2 of the icache entry)
+// and writes seen/shared through it.
+static GlobalVariable *getOrCreateIcacheEpochGlobal(Module &M) {
+  const char *GVName = "__ejit_icache_epoch";
+  if (auto *Existing = M.getGlobalVariable(GVName)) {
+    // The TU may already have DECLARED it (a test that prints the window, say).
+    // Upgrade the declaration to a definition rather than returning it as-is:
+    // leaving it undefined puts the probe back on cross-module resolution,
+    // which is exactly the failure this ownership change removes -- and it
+    // would be silent, because an unbound window reads as "always fresh".
+    if (Existing->isDeclaration()) {
+      Existing->setLinkage(GlobalValue::LinkOnceODRLinkage);
+      Existing->setInitializer(
+          ConstantAggregateZero::get(Existing->getValueType()));
+      Existing->setVisibility(GlobalValue::HiddenVisibility);
+      Existing->setDSOLocal(true);
+      if (Existing->getAlign().valueOrOne() < Align(8))
+        Existing->setAlignment(Align(8));
+    }
+    return Existing;
+  }
+  LLVMContext &Ctx = M.getContext();
+  auto *I32Ty = Type::getInt32Ty(Ctx);
+  auto *PtrTy = PointerType::getUnqual(Ctx);
+  auto *I64Ty = Type::getInt64Ty(Ctx);
+  auto *Ty = StructType::get(Ctx, {I64Ty, PtrTy});
+  auto *GV = new GlobalVariable(M, Ty, /*isConstant=*/false,
+                                GlobalValue::LinkOnceODRLinkage,
+                                ConstantAggregateZero::get(Ty), GVName);
+  GV->setAlignment(Align(8));
+  // A local definition, so the probe reaches it with adrp+add rather than a
+  // GOT load -- one fewer dependent load on the hit path.
+  GV->setVisibility(GlobalValue::HiddenVisibility);
+  GV->setDSOLocal(true);
+  return GV;
+}
+
 // Emit registration that fills each per-function dense-funcIndex global with
 // the index the process-global EJitFuncRegistry assigns by name: ejit_register_
 // funcindex() calls in ejit_auto_register (constructor path) plus private
@@ -418,11 +466,22 @@ emitIcacheSlotRegistration(Module &M,
   };
   SmallVector<Constant *, 16> Entries;
   for (auto &KV : Fns) {
+    // name2 (spare for icache entries) carries the probe's epoch window, so the
+    // runtime writes seen/shared into the object the probe actually reads.
+    Constant *EpochWin =
+        ConstantExpr::getBitCast(getOrCreateIcacheEpochGlobal(M), PtrTy);
     Entries.push_back(ConstantStruct::get(
         EntryTy, {ConstantInt::get(I32Ty, EJIT_REG_ICACHE_SLOT),
-                  makeStrGV(KV.first), ConstantPointerNull::get(PtrTy),
+                  makeStrGV(KV.first), EpochWin,
                   ConstantExpr::getBitCast(KV.second.GV, PtrTy),
-                  ConstantInt::get(I64Ty, KV.second.NumDims)}));
+                  // low 32: numDims. high 32: the probe contract version, so
+                  // the runtime can tell an epoch-checking probe from one built
+                  // before the check existed (see kEJitIcacheProbeAbi).
+                  ConstantInt::get(I64Ty,
+                                   static_cast<uint64_t>(KV.second.NumDims) |
+                                       (static_cast<uint64_t>(
+                                            kEJitIcacheProbeAbi)
+                                        << 32))}));
   }
   if (Entries.empty())
     return;
@@ -850,6 +909,9 @@ PreservedAnalyses EJitWrapperGenPass::run(Module &M,
 
       // Wrapper (F): frame-less probe + tail calls.
       auto *JitEntry = BasicBlock::Create(Ctx, "jit_entry", F);
+      // Created in control-flow order so the emitted IR reads top to bottom:
+      // entry -> epoch -> dispatch -> miss.
+      auto *JitIcacheEpoch = BasicBlock::Create(Ctx, "jit_icache_epoch", F);
       auto *JitIcacheDispatch = BasicBlock::Create(Ctx, "jit_icache_dispatch", F);
       auto *JitMiss = BasicBlock::Create(Ctx, "jit_miss", F);
       IRBuilder<> B(JitEntry);
@@ -885,7 +947,34 @@ PreservedAnalyses EJitWrapperGenPass::run(Module &M,
       Value *IHit = B.CreateIsNotNull(ICSlotLoad, "ejit_icache_hit");
       IHit = B.CreateIntrinsic(Intrinsic::expect, {IHit->getType()},
                                {IHit, ConstantInt::getTrue(Ctx)});
-      B.CreateCondBr(IHit, JitIcacheDispatch, JitMiss);
+      B.CreateCondBr(IHit, JitIcacheEpoch, JitMiss);
+
+      // Freshness: seen == *shared. A mismatch means a period toggled since this
+      // core last drained, so fall into the miss path, which drains and refills.
+      // Checked after the null test so `shared` is known bound (see
+      // EJitIcacheEpochRef).
+      B.SetInsertPoint(JitIcacheEpoch);
+      GlobalVariable *EpochGV = getOrCreateIcacheEpochGlobal(M);
+      auto *EpochTy = cast<StructType>(EpochGV->getValueType());
+      Value *SeenPtr = B.CreateStructGEP(EpochTy, EpochGV, 0, "ejit_ic_seen_p");
+      auto *SeenLoad =
+          B.CreateLoad(Type::getInt64Ty(Ctx), SeenPtr, "ejit_ic_seen");
+      SeenLoad->setAlignment(Align(8)); // 8 so seen+shared can pair in one ldp
+      Value *SharedPP =
+          B.CreateStructGEP(EpochTy, EpochGV, 1, "ejit_ic_shared_pp");
+      auto *SharedPLoad = B.CreateLoad(PtrTy, SharedPP, "ejit_ic_shared_p");
+      SharedPLoad->setAlignment(Align(8));
+      Value *Seen = SeenLoad;
+      Value *SharedP = SharedPLoad;
+      auto *CurLoad = B.CreateLoad(I32Ty, SharedP, "ejit_ic_epoch");
+      CurLoad->setAlignment(Align(4));
+      Value *CurEpoch = CurLoad;
+      Value *IFresh = B.CreateICmpEQ(
+          B.CreateZExt(CurEpoch, Type::getInt64Ty(Ctx)), Seen,
+          "ejit_icache_fresh");
+      IFresh = B.CreateIntrinsic(Intrinsic::expect, {IFresh->getType()},
+                                 {IFresh, ConstantInt::getTrue(Ctx)});
+      B.CreateCondBr(IFresh, JitIcacheDispatch, JitMiss);
 
       // Hit: tail-call the cached specialization directly (no release_read).
       // With -ejit-wrapper-timing the wrapper is NOT frame-less (JitEntry emits

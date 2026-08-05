@@ -170,12 +170,15 @@ void ejit_register_icache_slot(const char *funcName, void *slot,
 // specialization if a period toggled since this core last synced. Cheap when
 // nothing changed (one shared load); a no-op when the inline cache is not used.
 //
-// Cells are core-private, so ejit_deactivate only drains the core it runs on.
-// The runtime also syncs a core whenever it resolves through the taskpool, which
-// covers any core with a cold cell. A core whose cells are ALL warm never enters
-// the runtime and so never observes the toggle: such a core must call this
-// itself, once per period boundary, or it keeps running specializations built
-// for the previous period values.
+// Cells are core-private, so ejit_deactivate only drains the core it runs on,
+// and the runtime syncs a core whenever it resolves through the taskpool. A core
+// whose cells are ALL warm reaches neither -- so the wrapper's probe compares
+// the shared epoch on every call and treats a mismatch as a miss, which routes
+// that core through the taskpool and drains it. Correctness therefore does NOT
+// depend on calling this.
+//
+// It remains useful to force the drain at a known point (tests, or to move the
+// one-off re-resolve cost off a latency-critical call) but it is optional.
 void ejit_icache_sync(void);
 
 // Lifecycle. Activation is keyed by lifecycle/period name + instance index
