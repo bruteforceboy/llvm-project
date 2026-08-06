@@ -3428,17 +3428,43 @@ TEST_F(SharedTaskPoolTest, TwoCoresReconfiguringBothInvalidate) {
   const uint32_t vBeforeB = pool.state()->version[kDim][kInst].loadAcquire();
   EXPECT_FALSE(pool.setInstanceEnabled(kDim, kInst, true)); // core B activate
 
-  // Core B's bracket moved the version, so a specialization compiled against
-  // anything core A published is rejected by versionsCurrent ...
-  EXPECT_GT(pool.state()->version[kDim][kInst].loadAcquire(), vBeforeB)
-      << "core B's reconfiguration never reached the taskpool";
-  EXPECT_GT(pool.state()->version[kDim][kInst].loadAcquire(), v0);
-  // ... and it moved the icache epoch, so every core drains its cells.
+  // Core B's bracket moved the icache epoch, so every core drains its cells --
+  // which is what makes its write visible, since a cell holds no version.
   EXPECT_TRUE(pool.icacheSyncEpoch());
   EXPECT_FALSE(pool.icacheTry(kFunc, nullptr, 0, &out));
   EXPECT_EQ(slot, 0u);
 
+  // version[] does NOT move for core B: it changed no shared state, and its
+  // consumer discards in-flight compiles. See NoTransitionDoesNotBumpVersion.
+  EXPECT_EQ(pool.state()->version[kDim][kInst].loadAcquire(), vBeforeB);
+  EXPECT_GT(pool.state()->version[kDim][kInst].loadAcquire(), v0);
+
   ejitIcacheClearAll();
+}
+
+// A call that moves no shared state must not bump version[]. runCompile's
+// checkpoints DISCARD a finished compile when the version changes, and nothing
+// re-enqueues a dropped one -- so a redundant activate that bumped the version
+// would abort whatever the worker had in flight, permanently. Every core
+// activating the periods it shares is the normal startup shape, so this is the
+// difference between the JIT publishing and the JIT never publishing at all.
+TEST_F(SharedTaskPoolTest, NoTransitionDoesNotBumpVersion) {
+  EJitSharedTaskPool pool;
+  bringUpOwner(pool);
+  constexpr uint32_t kDim = 0, kInst = 3;
+
+  ASSERT_TRUE(pool.setInstanceEnabled(kDim, kInst, true)); // first core wins
+  const uint32_t v = pool.state()->version[kDim][kInst].loadAcquire();
+  const uint32_t e = pool.state()->icacheEpoch.loadAcquire();
+
+  // 20 more cores activate the same instance, as they do at startup.
+  for (int i = 0; i < 20; ++i)
+    EXPECT_FALSE(pool.setInstanceEnabled(kDim, kInst, true));
+
+  EXPECT_EQ(pool.state()->version[kDim][kInst].loadAcquire(), v)
+      << "a redundant activate aborts every in-flight compile";
+  // The epochs still move: those callers may have rewritten core-private data.
+  EXPECT_GT(pool.state()->icacheEpoch.loadAcquire(), e);
 }
 
 // The drain covers EVERY cell of a multi-dim array and every registered

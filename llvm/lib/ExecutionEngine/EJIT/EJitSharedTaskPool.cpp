@@ -532,15 +532,25 @@ bool EJitSharedTaskPool::setInstanceEnabled(uint32_t dimType,
   const bool flipped =
       state_->enabled[dimType][instanceId].compareExchange(expected, desired);
 
-  // Publish UNCONDITIONALLY -- see the header. The CAS owns the shared compile
-  // gate; the version and epochs answer "could a cached specialization have been
-  // baked from values that have since changed?", and for a caller that lost the
-  // CAS that is still yes -- it has its own core-private copy to rewrite.
-  state_->version[dimType][instanceId].fetchAdd(1);
-  // Neither the L0 nor the inline cache stores a version, so the bump above is
-  // invisible to both: each has its own epoch to drain against.
+  // The epochs publish UNCONDITIONALLY. Neither the L0 nor the inline cache
+  // stores a version, so an epoch is the only thing that can invalidate them,
+  // and a caller that LOST the CAS may still have rewritten its own
+  // core-private period values -- so the answer to "could a cached
+  // specialization have been baked from values that have since changed?" is
+  // still yes for it.
   state_->dispatchEpoch.fetchAdd(1);
   state_->icacheEpoch.fetchAdd(1);
+
+  // version[] answers a NARROWER question -- "did the state of THIS instance
+  // change?" -- and has a different consumer: runCompile's checkpoints, which
+  // DISCARD a finished compile when it moves. So it must move only on a real
+  // transition. Bumping it on a lost CAS aborts in-flight compiles for a call
+  // that changed nothing, and N cores activating the same instance at startup
+  // (the normal shape: every core activates the periods it shares) then drop
+  // the worker's result N-1 times. Nothing re-enqueues a dropped compile, so
+  // the JIT never publishes and every core waits forever.
+  if (flipped)
+    state_->version[dimType][instanceId].fetchAdd(1);
   // Latch on the first enable of ANY instance: this brackets the init→activate
   // window during which instanceDisabled hits are tallied separately
   // (instanceDisabledPreActivate) for diagnosing the pre-activate fallback

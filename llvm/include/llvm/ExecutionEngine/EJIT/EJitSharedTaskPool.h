@@ -637,17 +637,25 @@ public:
   void releaseRead(uint32_t bucketIndex);
   /// Drive one end of a period-value mutation window for a lifecycle instance.
   ///
-  /// Two facts here must not be conflated: the shared `enabled` bit is the JIT
-  /// compile gate and is CAS'd, so only the first caller in each direction moves
-  /// it; the version and the two epochs instead say "the values under this
-  /// instance may now differ from what a cached specialization was baked with",
-  /// which is true for EVERY caller. Period data is core-private while the
-  /// specialization is SHARED, so N cores each bracket their own writes over the
-  /// one shared bit - publishing only on the transition loses every core but the
-  /// first, and their writes land in a window nothing announced.
+  /// Three things move here, on two different triggers.
   ///
-  /// \returns whether the enabled BIT flipped. The publication happens either
-  /// way.
+  /// The shared `enabled` bit is the JIT compile gate and is CAS'd, so only the
+  /// first caller in each direction moves it.
+  ///
+  /// The two EPOCHS move on EVERY call. Period data is core-private while the
+  /// specialization is SHARED, so N cores each bracket their own writes over the
+  /// one shared bit; a caller that lost the CAS may still have rewritten its own
+  /// copy, and neither the L0 nor the inline cache stores a version, so an epoch
+  /// is the only thing that can drop what they cached.
+  ///
+  /// version[] moves ONLY on a real transition. Its consumer is runCompile's
+  /// checkpoints, which DISCARD a finished compile when it changes - so bumping
+  /// it for a call that changed nothing aborts in-flight compiles. Every core
+  /// activating the periods it shares is the normal startup shape, and a dropped
+  /// compile is never re-enqueued, so an unconditional bump there stalls the JIT
+  /// permanently.
+  ///
+  /// \returns whether the enabled BIT flipped. The epochs publish either way.
   bool setInstanceEnabled(uint32_t dimType, uint32_t instanceId, bool enabled);
   /// Query the shared activation bit for a lifecycle instance — the read
   /// counterpart of setInstanceEnabled, and the single cross-core source of
