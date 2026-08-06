@@ -128,6 +128,13 @@ enum class EJitWorkerStep : uint32_t {
 #ifndef EJIT_ICACHE_MAX_DIMS
 #define EJIT_ICACHE_MAX_DIMS 4u
 #endif
+// How many filled cell indices a slot remembers so a drain can clear exactly
+// those. Beyond this the drain falls back to walking the whole array, so the
+// cap only trades memory (4 bytes per entry per slot, core-private) for how
+// many distinct dim identities one core can touch between two drains.
+#ifndef EJIT_ICACHE_DRAIN_LIST
+#define EJIT_ICACHE_DRAIN_LIST 16u
+#endif
 
 //===----------------------------------------------------------------------===//
 // Probe-visible epoch reference: core-private storage, shared target.
@@ -167,10 +174,14 @@ void ejitIcacheBindEpochWindow(void *window);
 /// Whether a probe window has been bound on this core.
 ///
 /// The probe reads `shared` WITHOUT a null check, on the strength of "a non-null
-/// cell implies a fill, hence registration, hence a bound window". That only
-/// holds if no registration path can wire a cell up without handing over the
-/// window, so ejit_register_icache_slot() consults this and declines otherwise.
+/// cell implies a fill, hence registration, hence a bound window". That holds
+/// because ejitIcacheRegisterSlot() binds the window it was handed before
+/// wiring the cell up, and declines any entry that brings none.
 bool ejitIcacheEpochWindowBound();
+
+/// The window currently bound on this core, or null. Diagnostic, and the way a
+/// caller can check that two registrations name the same merged window.
+void *ejitIcacheBoundWindow();
 
 // Test/diagnostic: clear every icache slot. The slot-pointer table is
 // process-static storage shared across pool instances, so tests clear it
@@ -182,10 +193,21 @@ void ejitIcacheClearAll();
 // them for a multi-version entry), and \p numDims is its dimensionality. The
 // runtime writes the frozen specialization pointer through the cell at
 // [i0][i1]... (linearized from dims) on a successful resolve (icacheFill); the
-// wrapper reads the cell directly. Called from ejit_register_icache_slot
+// wrapper reads the cell directly. Called from ejit_register_icache_entry
 // (name->funcIndex resolution) at ejit_auto_register / .ejit_period time.
-// No-op for an out-of-range funcIndex or null base.
-void ejitIcacheRegisterSlot(uint32_t funcIndex, void *base, uint32_t numDims);
+//
+// \p window and \p probeAbi are the ENTRY'S OWN evidence that its wrapper
+// carries the current probe contract. Per-entry, not a process-global
+// handshake: a global "is some window bound?" gate is satisfied by whichever TU
+// registered first, so in a mixed link a pre-epoch TU would register against a
+// newer TU's window and get cells its probe can never invalidate.
+//
+// Returns false (registering nothing) for an out-of-range funcIndex, a null
+// base, numDims above the cap, probeAbi != kEJitIcacheProbeAbi, a null window,
+// or a window disagreeing with one already bound. Declining is the safe
+// degradation: the cell stays null and the taskpool serves every call.
+bool ejitIcacheRegisterSlot(uint32_t funcIndex, void *base, uint32_t numDims,
+                            void *window, uint32_t probeAbi);
 
 /// Diagnostic: dump every registered icache slot to the diagnostic log.
 /// Shows funcIndex, base pointer, numDims, and cell[0] (the scalar or

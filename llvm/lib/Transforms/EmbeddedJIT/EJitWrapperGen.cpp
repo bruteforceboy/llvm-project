@@ -425,15 +425,15 @@ emitIcacheSlotRegistration(Module &M,
   auto *I32Ty = Type::getInt32Ty(Ctx);
   auto *I64Ty = Type::getInt64Ty(Ctx);
 
-  // void ejit_register_icache_slot(const char *name, void *slot, uint32_t numDims)
-  // numDims tells the runtime the [D]^numDims shape so icacheFill can linearize.
-  M.getOrInsertFunction(
-      FN_REGISTER_ICACHE_SLOT,
-      FunctionType::get(Type::getVoidTy(Ctx), {PtrTy, PtrTy, I32Ty}, false));
-  // void ejit_register_icache_epoch(void *window, uint32_t probeAbi)
-  M.getOrInsertFunction(
-      FN_REGISTER_ICACHE_EPOCH,
-      FunctionType::get(Type::getVoidTy(Ctx), {PtrTy, I32Ty}, false));
+  // void ejit_register_icache_slot(const char *name, void *slot,
+  //                                 uint32_t numDims, void *window,
+  //                                 uint32_t probeAbi)
+  // numDims gives the [D]^numDims shape for icacheFill; window + probeAbi are
+  // this object's proof that its probe carries the shared-epoch check.
+  M.getOrInsertFunction(FN_REGISTER_ICACHE_SLOT,
+                        FunctionType::get(Type::getVoidTy(Ctx),
+                                          {PtrTy, PtrTy, I32Ty, PtrTy, I32Ty},
+                                          false));
 
   Function *AutoReg = M.getFunction(FN_AUTO_REGISTER);
   bool CreatedAutoReg = false;
@@ -446,22 +446,18 @@ emitIcacheSlotRegistration(Module &M,
     CreatedAutoReg = true;
   }
   Instruction *Ret = AutoReg->getEntryBlock().getTerminator();
-  // The window FIRST: the runtime declines a slot it has no window for. This is
-  // the constructor path's counterpart of the name2/size fields the static
-  // registry entries below carry.
-  {
-    IRBuilder<> Builder(Ret);
-    Builder.CreateCall(
-        M.getFunction(FN_REGISTER_ICACHE_EPOCH),
-        {ConstantExpr::getBitCast(getOrCreateIcacheEpochGlobal(M), PtrTy),
-         ConstantInt::get(I32Ty, kEJitIcacheProbeAbi)});
-  }
+  // Each entry carries its own window + probe version: the constructor path's
+  // counterpart of the name2/size fields the static registry entries carry.
+  Constant *EpochWindow =
+      ConstantExpr::getBitCast(getOrCreateIcacheEpochGlobal(M), PtrTy);
   FunctionCallee FnReg = M.getFunction(FN_REGISTER_ICACHE_SLOT);
   for (auto &KV : Fns) {
     IRBuilder<> Builder(Ret);
     Value *Name = Builder.CreateGlobalString(KV.first);
     Builder.CreateCall(FnReg, {Name, Builder.CreateBitCast(KV.second.GV, PtrTy),
-                               ConstantInt::get(I32Ty, KV.second.NumDims)});
+                               ConstantInt::get(I32Ty, KV.second.NumDims),
+                               EpochWindow,
+                               ConstantInt::get(I32Ty, kEJitIcacheProbeAbi)});
   }
 
   if (EnableEJitGlobalCtors && CreatedAutoReg)
@@ -982,7 +978,14 @@ PreservedAnalyses EJitWrapperGenPass::run(Module &M,
       SharedPLoad->setAlignment(Align(8));
       Value *Seen = SeenLoad;
       Value *SharedP = SharedPLoad;
+      // ATOMIC: `seen` and `shared` are core-private, but peers update *shared
+      // with an RMW, so a plain load here would be a data race rather than
+      // bounded staleness. monotonic is enough -- single-location coherence is
+      // the whole question, the cell it guards was written by this core, and
+      // the slow path re-reads with acquire. Lowers to the same LDR on AArch64;
+      // acquire would cost an LDAR per hit.
       auto *CurLoad = B.CreateLoad(I32Ty, SharedP, "ejit_ic_epoch");
+      CurLoad->setAtomic(AtomicOrdering::Monotonic);
       CurLoad->setAlignment(Align(4));
       Value *CurEpoch = CurLoad;
       Value *IFresh = B.CreateICmpEQ(

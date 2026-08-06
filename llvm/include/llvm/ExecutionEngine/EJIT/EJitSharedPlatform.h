@@ -77,6 +77,16 @@ constexpr uint32_t kEJitSharedAbiMagic = 0x456A5370u; // "EjSp"
 /// CAS on the shared enabled bit but still rewrote its own period values.
 constexpr uint32_t kEJitSharedAbiVersion = 8u;
 
+/// Contract version between the AOT-emitted inline-cache probe and the runtime,
+/// carried by every icache registration.
+///   1 = cell load + null check only; a core that only ever hits never
+///       invalidates.
+///   2 = adds the shared-epoch freshness check (see EJitIcacheEpochRef).
+/// The runtime requires EQUALITY: the number moves when the probe's obligations
+/// change, so a higher one means obligations this runtime does not implement.
+/// An object built before the stamp existed reports 0.
+constexpr uint32_t kEJitIcacheProbeAbi = 2;
+
 /// Sentinel "no core" id. Out of any plausible core-id range.
 constexpr uint32_t kEJitInvalidCoreId = 0xFFFFFFFFu;
 

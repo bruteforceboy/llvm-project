@@ -154,30 +154,18 @@ void ejit_register_lifecycle(const char *lifecycleName, uint32_t *slotOut);
 // funcIndex global; a capacity failure is recorded so ejit_init can fail.
 void ejit_register_funcindex(const char *funcName, uint32_t *slotOut);
 
-// Register the wrapper's per-function inline-cache slot (@__ejit_icache_fn_<name>
-// global address) by name, with its dimensionality (number of ejit_dim params).
-// The runtime writes the frozen specialization pointer through the [D]^numDims
-// cell at [i0][i1]... on a successful resolve (icacheFill); the wrapper reads
-// the cell directly on the hit path (GEP + one plain load + null-check, then
-// the shared-epoch check, then the indirect call - no ejit_icache_try call).
-// Keys the slot by the SAME registry funcIndex assigned by
-// ejit_register_funcindex. Called by AOT auto-registration.
-// A null slot or capacity exhaustion is recorded; the base stays null and the
-// probe misses. Also declined when no epoch window has been registered yet (see
-// ejit_register_icache_epoch): the probe reads the window without a null check,
-// so a wired-up cell with no window behind it faults on the first hit.
+// Register a per-function inline-cache slot with the evidence that its wrapper
+// carries the current probe contract: \p window is that object's
+// @__ejit_icache_epoch, \p probeAbi the version it was built against. Declined
+// on probeAbi != kEJitIcacheProbeAbi, a null/conflicting window, or numDims
+// above the cap; a declined slot leaves its cell null so every call resolves
+// through the taskpool.
 void ejit_register_icache_slot(const char *funcName, void *slot,
-                               uint32_t numDims);
+                               uint32_t numDims, void *window,
+                               uint32_t probeAbi);
 
-// Hand over the AOT-emitted @__ejit_icache_epoch window (the { seen, shared }
-// pair the probe compares on every call) and the probe contract version the
-// object was built against. Emitted by AOT auto-registration before the slot
-// registrations. Passing the window by ADDRESS is what guarantees the runtime
-// writes the bytes the probe reads - see ejitIcacheBindEpochWindow.
-//
-// A \p probeAbi below kEJitIcacheProbeAbi leaves the window unbound, which makes
-// every later ejit_register_icache_slot decline: the inline cache stays off and
-// all calls resolve through the taskpool - correct, just without the fast path.
+// Superseded by the window/probeAbi parameters above. No-op, kept so an object
+// built before that change still links.
 void ejit_register_icache_epoch(void *window, uint32_t probeAbi);
 
 // Bring the CALLING core's inline cache up to date, dropping every cached

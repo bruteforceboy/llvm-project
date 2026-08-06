@@ -34,10 +34,13 @@
 ; ... then the epoch check, which is only reached with a non-null cell -- so a
 ; fill has happened, so the runtime has bound `shared` and no null check on it
 ; is required.
+; seen/shared are core-private, so they stay plain loads. *shared is not: peers
+; update it with an RMW, so it is atomic. monotonic lowers to the same LDR on
+; AArch64; acquire would cost an LDAR per hit.
 ; CHECK: jit_icache_epoch:
 ; CHECK: %ejit_ic_seen = load i64, ptr @__ejit_icache_epoch, align 8
 ; CHECK: %ejit_ic_shared_p = load ptr, ptr getelementptr {{.*}} @__ejit_icache_epoch, i32 0, i32 1
-; CHECK: %ejit_ic_epoch = load i32, ptr %ejit_ic_shared_p
+; CHECK: %ejit_ic_epoch = load atomic i32, ptr %ejit_ic_shared_p monotonic, align 4
 ; CHECK: %ejit_icache_fresh = icmp eq
 ; CHECK: br i1 {{.*}}, label %jit_icache_dispatch, label %jit_miss
 
@@ -47,18 +50,15 @@
 ; CHECK: jit_miss:
 ; CHECK: musttail call i32 @dim_entry_miss(
 
-; Both loads are plain: a stale read costs at most one extra call into the
-; previous specialization, so no atomic/acquire is emitted.
-; CHECK-NOT: load atomic
+; The cell itself is core-private, so its load stays plain.
+; CHECK-NOT: %ejit_ic_fn = load atomic
 
-; The CONSTRUCTOR path must carry the same two facts: the static registry above
-; is only walked when forceStaticRegistry is set or the constructor produced
-; nothing, so a default init sees ONLY these calls. Without the window, cells
-; fill normally while `shared` stays null and the first hit faults. The runtime
-; declines a slot it has no window for, hence the window is registered FIRST.
+; The CONSTRUCTOR path carries the same two facts per entry, in one call (the
+; static registry above is only walked when forceStaticRegistry is set or the
+; constructor produced nothing). Per-entry, not a global handshake: that would
+; let a pre-epoch TU register against a newer TU's window in a mixed link.
 ; CHECK-LABEL: define internal void @ejit_auto_register()
-; CHECK: call void @ejit_register_icache_epoch(ptr @__ejit_icache_epoch, i32 2)
-; CHECK-NEXT: call void @ejit_register_icache_slot(ptr {{.*}}, ptr @__ejit_icache_fn_dim_entry, i32 1)
+; CHECK: call void @ejit_register_icache_slot(ptr {{.*}}, ptr @__ejit_icache_fn_dim_entry, i32 1, ptr @__ejit_icache_epoch, i32 2)
 
 ; Flag off: no probe, so nothing reads the epoch and the symbol never appears.
 ; OFF-NOT: __ejit_icache_epoch

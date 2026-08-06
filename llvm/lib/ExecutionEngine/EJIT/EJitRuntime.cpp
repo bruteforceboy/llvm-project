@@ -347,28 +347,22 @@ void ejit_register_funcindex(const char *funcName, uint32_t *slotOut) {
 }
 
 void ejit_register_icache_slot(const char *funcName, void *slot,
-                               uint32_t numDims) {
+                               uint32_t numDims, void *window,
+                               uint32_t probeAbi) {
   // Wire the wrapper's per-function @__ejit_icache_fn_<name> slot into the
   // runtime slot registry, keyed by the SAME registry funcIndex
-  // ejit_register_funcindex assigns by name. numDims is the [D]^numDims shape
-  // so icacheFill can linearize. The wrapper reads the cell directly on the
-  // icache hit path; icacheFill writes the frozen specialization pointer through
-  // it on resolve. Idempotent by name (resolveAssign is). A null slot or
-  // unresolvable name is recorded; the base stays null and the wrapper's probe
-  // cleanly misses -> taskpool fallback.
+  // ejit_register_funcindex assigns by name. \p window and \p probeAbi are this
+  // object's own evidence that its probe carries the shared-epoch check.
   if (!funcName || !slot) {
     EJIT_DIAG("register_icache_slot reject: name=%p slot=%p",
               (const void *)funcName, slot);
     return;
   }
-  EJIT_DIAG_VERBOSE("register_icache_slot name=%s numDims=%u", funcName, numDims);
 #ifdef EJIT_SRE_TASKPOOL
   if (gEJIT && gEJIT->registrationFrozen()) {
     EJitRegistrationStore::instance().recordError(
         EJIT_ERR_INVALID_PARAM, "icache slot registration after init is frozen",
         funcName);
-    EJIT_DIAG("register_icache_slot reject name=%s: registration frozen",
-              funcName);
     return;
   }
 #endif
@@ -377,54 +371,40 @@ void ejit_register_icache_slot(const char *funcName, void *slot,
     EJitRegistrationStore::instance().recordError(
         EJIT_ERR_CACHE_FULL, "funcIndex capacity exhausted for icache slot",
         funcName);
-    EJIT_DIAG("register_icache_slot FAIL name=%s: funcIndex capacity exhausted",
-              funcName);
     return;
   }
 #ifdef EJIT_SRE_SHARED_TASKPOOL
-  // The probe reads the epoch window with no null check, on the strength of "a
-  // non-null cell implies registration implies a bound window". Wiring up a cell
-  // before the window exists breaks that as a fault on the first hit, not as a
-  // miss, so decline instead.
-  if (!ejitIcacheEpochWindowBound()) {
+  if (!ejitIcacheRegisterSlot(idx, slot, numDims, window, probeAbi)) {
     EJitRegistrationStore::instance().recordError(
         EJIT_ERR_INVALID_PARAM,
-        "icache slot registered before its epoch window (object needs "
-        "ejit_register_icache_epoch, or its probe ABI was rejected)",
+        "icache slot declined (probe ABI mismatch, missing/conflicting epoch "
+        "window, or numDims above the cap)",
         funcName);
-    EJIT_DIAG("register_icache_slot reject name=%s: no epoch window bound "
-              "(inline cache stays off; calls resolve through the taskpool)",
-              funcName);
+    EJIT_DIAG("icache DISABLED for %s: probeAbi=%u (expected %u) window=%p "
+              "bound=%p numDims=%u -- rebuild this object with THIS clang",
+              funcName, probeAbi,
+              static_cast<unsigned>(kEJitIcacheProbeAbi), window,
+              ejitIcacheBoundWindow(), numDims);
     return;
   }
-#endif
-  ejitIcacheRegisterSlot(idx, slot, numDims);
   EJIT_DIAG_VERBOSE("register_icache_slot OK name=%s idx=%u numDims=%u",
                     funcName, idx, numDims);
-}
-
-void ejit_register_icache_epoch(void *window, uint32_t probeAbi) {
-#ifdef EJIT_SRE_SHARED_TASKPOOL
-  if (!window) {
-    EJIT_DIAG("register_icache_epoch reject: null window");
-    return;
-  }
-  if (probeAbi < kEJitIcacheProbeAbi) {
-    // Leaving the window unbound makes every following slot registration
-    // decline, so cells stay null and all calls miss to the taskpool. Correct,
-    // unlike a probe that cannot see a period toggle.
-    EJIT_DIAG("icache DISABLED: probe ABI %u < %u (object predates the "
-              "shared-epoch check -- rebuild it with THIS clang; the runtime "
-              "alone is not enough)",
-              probeAbi, static_cast<unsigned>(kEJitIcacheProbeAbi));
-    return;
-  }
-  ejitIcacheBindEpochWindow(window);
 #else
+  (void)slot;
+  (void)numDims;
   (void)window;
   (void)probeAbi;
 #endif
 }
+
+// Superseded: the window now travels with each slot. Kept as a no-op so an
+// object built before that change still links; it must NOT bind anything,
+// since a process-global window is what let a pre-epoch TU register.
+void ejit_register_icache_epoch(void *window, uint32_t probeAbi) {
+  (void)window;
+  (void)probeAbi;
+}
+
 
 namespace {
 // Drain THIS core's inline cache if a period toggled since it last synced.

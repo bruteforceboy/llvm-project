@@ -15,6 +15,7 @@
 #define LLVM_EXECUTIONENGINE_EJIT_EJITCOMMON_H
 
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/ExecutionEngine/EJIT/EJitSharedPlatform.h" // kEJitIcacheProbeAbi
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/DataLayout.h"
 #include "llvm/IR/DerivedTypes.h"
@@ -81,36 +82,18 @@ constexpr const char *FN_REGISTER_PERIOD_ARRAY = "ejit_register_period_array";
 constexpr const char *FN_REGISTER_STATIC_VAR = "ejit_register_static_var";
 constexpr const char *FN_REGISTER_LIFECYCLE = "ejit_register_lifecycle";
 constexpr const char *FN_REGISTER_FUNCINDEX = "ejit_register_funcindex";
-// Per-function inline-cache slot registration: the wrapper's per-function
-// @__ejit_icache_fn_<name> global (a frozen, sticky specialization pointer) is
-// registered by name so the runtime can backfill it on a successful resolve
-// (icacheFill). The wrapper reads it directly with an inline plain load - no
-// ejit_icache_try call - so the hit path is one load + null-check, the
-// shared-epoch check, then the indirect call.
-// Signature: void ejit_register_icache_slot(const char *name, void *slot).
+// Per-function inline-cache slot registration. Carries the cell array base,
+// its dimensionality, and the epoch window + probe ABI of the object it came
+// from, so a mixed link cannot let a pre-epoch TU register against a newer TU's
+// window. Signature:
+//   void ejit_register_icache_slot(const char *name, void *slot,
+//                                  uint32_t numDims, void *window,
+//                                  uint32_t probeAbi).
 constexpr const char *FN_REGISTER_ICACHE_SLOT = "ejit_register_icache_slot";
-// Hands the AOT-emitted @__ejit_icache_epoch window to the runtime plus the
-// probe contract version. Emitted into ejit_auto_register BEFORE any
-// ejit_register_icache_slot call: the runtime declines a slot whose window it
-// has not been given. The static .ejit_period registry carries the same two
-// facts in the icache entry's name2 / size fields.
-// Signature: void ejit_register_icache_epoch(void *window, uint32_t probeAbi).
-constexpr const char *FN_REGISTER_ICACHE_EPOCH = "ejit_register_icache_epoch";
 
-// Contract version between the AOT-emitted inline-cache probe and the runtime.
-// Bumped whenever the probe's obligations change, and stamped into the high 32
-// bits of the static-registry `size` field (the low 32 carry numDims, which is
-// <= 4) so a mismatch is detected at init instead of silently mis-executing.
-//
-//   1 = cell load + null check only. Invalidation depends entirely on the
-//       core reaching a sync point, so a core that only ever hits runs a stale
-//       specialization forever.
-//   2 = adds the shared-epoch freshness check (see EJitIcacheEpochRef).
-//
-// An object built by an older clang reports 0 in those bits; the runtime treats
-// anything < kEJitIcacheProbeAbi as "this build cannot invalidate a hot core"
-// and says so loudly at init rather than running quietly wrong.
-constexpr uint32_t kEJitIcacheProbeAbi = 2;
+// kEJitIcacheProbeAbi lives in EJitSharedPlatform.h so the runtime, the AOT
+// pass and the standalone taskpool tests share one definition. The static
+// registry stamps it into the high 32 bits of `size` (low 32 = numDims).
 constexpr const char *FN_TASKPOOL_COMPILE_OR_GET =
     "ejit_taskpool_compile_or_get";
 // Fixed-dimension fast-path C ABI entries (0-4 dims), emitted by the wrapper

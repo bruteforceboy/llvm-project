@@ -152,6 +152,16 @@ constexpr uint64_t kHashMul = 0x9e3779b97f4a7c15ULL;
 struct EJitIcacheSlotReg {
   uintptr_t *base;
   uint32_t numDims;
+  // The cells this core has written since its last drain, so the drain clears
+  // exactly those. Fills land at icacheLinearize(dims), i.e. sparsely at
+  // whichever dim identities this core calls: a drain can neither stop at the
+  // first zero cell (identity 5 alone leaves 0..4 zero) nor bound itself to
+  // [min,max] cheaply -- identities 0 and 15 of a 4D entry span the whole
+  // 65536-cell array. Recording the indices costs one store on the miss path
+  // and makes the drain O(identities this core actually used), which is 1 for
+  // the usual one-identity-per-core shape.
+  uint32_t fills;                          // 0 = nothing to clear
+  uint32_t filled[EJIT_ICACHE_DRAIN_LIST]; // valid while fills <= the cap
 };
 EJitIcacheSlotReg gIcacheSlots[EJIT_ICACHE_FUNC_SLOTS];
 
@@ -200,10 +210,13 @@ void llvm::ejit::ejitIcacheBindEpochWindow(void *window) {
 
 bool llvm::ejit::ejitIcacheEpochWindowBound() { return gProbeEpoch != nullptr; }
 
-void llvm::ejit::ejitIcacheRegisterSlot(uint32_t funcIndex, void *base,
-                                        uint32_t numDims) {
+void *llvm::ejit::ejitIcacheBoundWindow() { return gProbeEpoch; }
+
+bool llvm::ejit::ejitIcacheRegisterSlot(uint32_t funcIndex, void *base,
+                                        uint32_t numDims, void *window,
+                                        uint32_t probeAbi) {
   if (funcIndex >= EJIT_ICACHE_FUNC_SLOTS || !base)
-    return;
+    return false;
   // numDims sizes the [D]^numDims cell array the drain walks, so an out-of-cap
   // value is a write far past the end of the wrapper's global. The AOT pass
   // never emits one (it skips entries above the cap), but numDims arrives here
@@ -211,9 +224,26 @@ void llvm::ejit::ejitIcacheRegisterSlot(uint32_t funcIndex, void *base,
   // than trust it. Leaving the slot unregistered is the documented safe
   // degradation: probes miss and the taskpool serves every call.
   if (numDims > EJIT_ICACHE_MAX_DIMS)
-    return;
+    return false;
+
+  // The probe contract is carried PER SLOT: a global "is some window bound?"
+  // gate is satisfied by whichever TU registered first, so in a mixed link a
+  // pre-epoch TU's slots would register against a newer TU's window and get
+  // cells its probe can never invalidate.
+  if (probeAbi != kEJitIcacheProbeAbi || !window)
+    return false;
+  // @__ejit_icache_epoch is linkonce_odr, so a correct link leaves exactly one
+  // window. A second address means the copies were not merged: that probe reads
+  // storage the runtime never writes, which reads as "always fresh" forever.
+  if (gProbeEpoch && gProbeEpoch != window)
+    return false;
+  if (!gProbeEpoch)
+    ejitIcacheBindEpochWindow(window);
+
   gIcacheSlots[funcIndex].base = reinterpret_cast<uintptr_t *>(base);
   gIcacheSlots[funcIndex].numDims = numDims;
+  gIcacheSlots[funcIndex].fills = 0;
+  return true;
 }
 
 void llvm::ejit::ejitIcacheClearAll() {
@@ -226,11 +256,15 @@ void llvm::ejit::ejitIcacheClearAll() {
   for (uint32_t f = 0; f < EJIT_ICACHE_FUNC_SLOTS; ++f) {
     gIcacheSlots[f].base = nullptr;
     gIcacheSlots[f].numDims = 0;
+    gIcacheSlots[f].fills = 0;
   }
   gIcacheSeenEpoch = 0;
   if (gProbeEpoch)
     gProbeEpoch->seen = 0;
   gIcacheSeenState = nullptr;
+  // "No slots" and "no window" are the same empty state; leaving one bound
+  // would make the next registration compare against a dead window.
+  gProbeEpoch = nullptr;
 }
 
 // Zero every registered cell array, so every probe misses and the next call
@@ -244,11 +278,20 @@ static void icacheDrainCells() {
     EJitIcacheSlotReg &reg = gIcacheSlots[f];
     if (!reg.base)
       continue;
+    if (!reg.fills)
+      continue; // never filled since the last drain: nothing to clear
     if (reg.numDims > EJIT_ICACHE_MAX_DIMS)
       continue; // defence in depth: never walk past a mis-sized array
     const uintptr_t cells = icacheCellCount(reg.numDims);
-    for (uintptr_t c = 0; c < cells; ++c)
-      reg.base[c] = 0;
+    if (reg.fills <= EJIT_ICACHE_DRAIN_LIST) {
+      for (uint32_t i = 0; i < reg.fills; ++i)
+        if (reg.filled[i] < cells)
+          reg.base[reg.filled[i]] = 0;
+    } else {
+      for (uintptr_t c = 0; c < cells; ++c) // more identities than we recorded
+        reg.base[c] = 0;
+    }
+    reg.fills = 0;
   }
 }
 
@@ -481,6 +524,9 @@ void EJitSharedTaskPool::icacheFill(uint32_t funcIndex, void *fnPtr,
   // No atomic/release: same-core, and the read's data dependency on the pointer
   // orders this store-before-use.
   uintptr_t idx = icacheLinearize(dims, numDims);
+  if (reg.fills < EJIT_ICACHE_DRAIN_LIST)
+    reg.filled[reg.fills] = static_cast<uint32_t>(idx);
+  ++reg.fills;
   reg.base[idx] = reinterpret_cast<uintptr_t>(fnPtr);
   EJIT_DIAG("icacheFill OK func=%u dims=%u idx=%zu fn=%p cell[0]=%p",
             funcIndex, numDims, (size_t)idx, fnPtr, (void *)reg.base[0]);

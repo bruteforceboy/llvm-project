@@ -76,14 +76,18 @@
 ; ICACHE: jit_icache_epoch:
 ; ICACHE: %ejit_ic_seen = load i64, ptr @__ejit_icache_epoch
 ; ICACHE: %ejit_ic_shared_p = load ptr, ptr getelementptr {{.*}} @__ejit_icache_epoch, i32 0, i32 1
-; ICACHE: %ejit_ic_epoch = load i32, ptr %ejit_ic_shared_p
+; The shared word is written by peers with an atomic RMW, so the probe reads it
+; atomically. monotonic lowers to the same LDR as a plain load on AArch64.
+; ICACHE: %ejit_ic_epoch = load atomic i32, ptr %ejit_ic_shared_p monotonic
 ; ICACHE: %ejit_icache_fresh = icmp eq
 ; ICACHE: br i1 {{.*}}, label %jit_icache_dispatch, label %jit_miss
 
-; --- registration carries numDims (3rd arg): 0 / 1 / 2 (DAG: order-independent). ---
-; ICACHE-DAG: call void @ejit_register_icache_slot({{.*}} @__ejit_icache_fn_zero_dim_entry, i32 0)
-; ICACHE-DAG: call void @ejit_register_icache_slot({{.*}} @__ejit_icache_fn_one_dim_entry, i32 1)
-; ICACHE-DAG: call void @ejit_register_icache_slot({{.*}} @__ejit_icache_fn_two_dim_entry, i32 2)
+; --- registration carries numDims (3rd arg): 0 / 1 / 2, and each entry carries
+; --- its OWN window + probe ABI so a mixed link cannot let a pre-epoch TU
+; --- register against a newer TU's window (DAG: order-independent). ---
+; ICACHE-DAG: call void @ejit_register_icache_slot({{.*}} @__ejit_icache_fn_zero_dim_entry, i32 0, ptr @__ejit_icache_epoch, i32 2)
+; ICACHE-DAG: call void @ejit_register_icache_slot({{.*}} @__ejit_icache_fn_one_dim_entry, i32 1, ptr @__ejit_icache_epoch, i32 2)
+; ICACHE-DAG: call void @ejit_register_icache_slot({{.*}} @__ejit_icache_fn_two_dim_entry, i32 2, ptr @__ejit_icache_epoch, i32 2)
 
 ; --- Default (flag OFF): no icache anywhere; original compile_or_get path. ---
 ; NOICACHE-LABEL: define i32 @one_dim_entry(

@@ -205,6 +205,16 @@ bool startOkIgnoreCtx(void * /*ctx*/,
   return true;
 }
 
+// A well-formed registration. In a correct link every entry names the one
+// linkonce_odr @__ejit_icache_epoch, so honour a window a test bound
+// explicitly. The mixed-version tests call the entry point directly.
+EJitIcacheEpochRef gTestWindow;
+bool registerSlot(uint32_t funcIndex, void *base, uint32_t numDims) {
+  void *w = ejitIcacheBoundWindow();
+  return ejitIcacheRegisterSlot(funcIndex, base, numDims,
+                                w ? w : &gTestWindow, kEJitIcacheProbeAbi);
+}
+
 EJitDimPair dim(uint32_t t, uint32_t i) { return EJitDimPair{t, i}; }
 
 class SharedTaskPoolTest : public ::testing::Test {
@@ -2685,7 +2695,7 @@ TEST_F(SharedTaskPoolTest, InlineCacheStickyFrozen) {
   // Register a per-function icache slot (the wrapper's @__ejit_icache_fn_
   // global, here a test-local stand-in) so icacheFill has somewhere to write.
   uintptr_t slot = 0;
-  ejitIcacheRegisterSlot(kFunc, &slot, 0);
+  registerSlot(kFunc, &slot, 0);
   void *fn = codeFor(kFunc);
   void *out = nullptr;
   // compile_or_get syncs at entry before every fill; mirror that here.
@@ -2738,9 +2748,12 @@ TEST_F(SharedTaskPoolTest, InlineCacheHighFuncIndex) {
   // Top of the table: funcIndex = EJIT_ICACHE_FUNC_SLOTS - 1.
   constexpr uint32_t kTop = EJIT_ICACHE_FUNC_SLOTS - 1;
   uintptr_t slotTop = 0;
-  ejitIcacheRegisterSlot(kTop, &slotTop, 0);
+  registerSlot(kTop, &slotTop, 0);
   void *fnTop = codeFor(kTop);
   void *out = nullptr;
+  // compile_or_get syncs at entry before every fill; mirror that here, or
+  // icacheFill drops the fill as raced by a toggle it never saw.
+  pool.icacheSyncEpoch();
 
   EXPECT_FALSE(pool.icacheTry(kTop, nullptr, 0, &out));
   EXPECT_EQ(out, nullptr);
@@ -2751,7 +2764,7 @@ TEST_F(SharedTaskPoolTest, InlineCacheHighFuncIndex) {
   // Mid-table index that the old 64-slot table would have dropped.
   constexpr uint32_t kMid = 2000;
   uintptr_t slotMid = 0;
-  ejitIcacheRegisterSlot(kMid, &slotMid, 0);
+  registerSlot(kMid, &slotMid, 0);
   void *fnMid = codeFor(kMid);
   pool.icacheFill(kMid, fnMid, nullptr, 0);
   EXPECT_TRUE(pool.icacheTry(kMid, nullptr, 0, &out));
@@ -2775,7 +2788,7 @@ TEST_F(SharedTaskPoolTest, InlineCacheAutoDisablesWhenReclamationWired) {
   bringUpOwner(pool);
   constexpr uint32_t kFunc = 3;
   uintptr_t slot = 0;
-  ejitIcacheRegisterSlot(kFunc, &slot, 0);
+  registerSlot(kFunc, &slot, 0);
   void *fn = codeFor(kFunc);
   void *out = nullptr;
   pool.icacheSyncEpoch();
@@ -2816,7 +2829,7 @@ TEST_F(SharedTaskPoolTest, InlineCacheMultiVersion) {
   // runtime reaches cells through an EJitAtomicUPtr* + linearized index.
   constexpr uint32_t D = EJIT_ICACHE_DIM_SIZE;
   uintptr_t slots[D][D] = {};
-  ejitIcacheRegisterSlot(kFunc, &slots[0][0], 2);
+  registerSlot(kFunc, &slots[0][0], 2);
   pool.icacheSyncEpoch();
 
   void *fn00 = codeFor(kFunc);
@@ -3339,7 +3352,7 @@ TEST_F(SharedTaskPoolTest, InlineCacheDrainsOnPeriodToggle) {
   bringUpOwner(pool);
   constexpr uint32_t kFunc = 3;
   uintptr_t slot = 0;
-  ejitIcacheRegisterSlot(kFunc, &slot, 0);
+  registerSlot(kFunc, &slot, 0);
   void *fn = codeFor(kFunc);
   void *out = nullptr;
 
@@ -3408,7 +3421,7 @@ TEST_F(SharedTaskPoolTest, TwoCoresReconfiguringBothInvalidate) {
   bringUpOwner(pool);
   constexpr uint32_t kDim = 0, kInst = 5, kFunc = 9;
   uintptr_t slot = 0;
-  ejitIcacheRegisterSlot(kFunc, &slot, 0);
+  registerSlot(kFunc, &slot, 0);
   void *fn = codeFor(kFunc);
   void *out = nullptr;
 
@@ -3438,6 +3451,187 @@ TEST_F(SharedTaskPoolTest, TwoCoresReconfiguringBothInvalidate) {
   // consumer discards in-flight compiles. See NoTransitionDoesNotBumpVersion.
   EXPECT_EQ(pool.state()->version[kDim][kInst].loadAcquire(), vBeforeB);
   EXPECT_GT(pool.state()->version[kDim][kInst].loadAcquire(), v0);
+
+  ejitIcacheClearAll();
+}
+
+//===----------------------------------------------------------------------===//
+// Mixed-version links: the probe contract travels per entry, so a TU built
+// before the epoch check existed can never register against a newer TU's
+// window and get cells its probe cannot invalidate.
+//===----------------------------------------------------------------------===//
+
+// New TU first, then old. The old TU must NOT inherit the bound window.
+TEST_F(SharedTaskPoolTest, MixedVersionNewThenOldDeclinesTheOldTU) {
+  ejitIcacheClearAll();
+  EJitIcacheEpochRef windowNew{};
+  uintptr_t cellNew = 0, cellOld = 0;
+
+  EXPECT_TRUE(ejitIcacheRegisterSlot(1, &cellNew, 0, &windowNew,
+                                     kEJitIcacheProbeAbi));
+  ASSERT_EQ(ejitIcacheBoundWindow(), &windowNew);
+
+  // A pre-epoch object reports ABI 0 and brings no window; a global gate would
+  // say "a window is bound, go ahead".
+  EXPECT_FALSE(ejitIcacheRegisterSlot(2, &cellOld, 0, nullptr, 0))
+      << "a pre-epoch TU rode in on the new TU's window";
+  // Naming the window does not help it either: the version is what is checked.
+  EXPECT_FALSE(ejitIcacheRegisterSlot(2, &cellOld, 0, &windowNew, 0));
+  EXPECT_FALSE(ejitIcacheRegisterSlot(2, &cellOld, 0, &windowNew, 1));
+
+  ejitIcacheClearAll();
+}
+
+// Old TU first: it is declined and leaves nothing bound, so the new TU still
+// comes up with a working cache.
+TEST_F(SharedTaskPoolTest, MixedVersionOldThenNewStillServesTheNewTU) {
+  ejitIcacheClearAll();
+  EJitIcacheEpochRef windowNew{};
+  uintptr_t cellOld = 0, cellNew = 0;
+
+  EXPECT_FALSE(ejitIcacheRegisterSlot(1, &cellOld, 0, nullptr, 0));
+  EXPECT_EQ(ejitIcacheBoundWindow(), nullptr)
+      << "a declined entry must not bind a window";
+
+  EXPECT_TRUE(ejitIcacheRegisterSlot(2, &cellNew, 0, &windowNew,
+                                     kEJitIcacheProbeAbi));
+  EXPECT_EQ(ejitIcacheBoundWindow(), &windowNew);
+
+  ejitIcacheClearAll();
+}
+
+// A future version means obligations this runtime does not implement.
+TEST_F(SharedTaskPoolTest, FutureProbeAbiIsRejected) {
+  ejitIcacheClearAll();
+  EJitIcacheEpochRef window{};
+  uintptr_t cell = 0;
+  EXPECT_FALSE(ejitIcacheRegisterSlot(1, &cell, 0, &window,
+                                      kEJitIcacheProbeAbi + 1));
+  EXPECT_EQ(ejitIcacheBoundWindow(), nullptr);
+  ejitIcacheClearAll();
+}
+
+// Two window addresses means the linkonce_odr copies were not merged, so one
+// probe would read storage the runtime never writes.
+TEST_F(SharedTaskPoolTest, ConflictingEpochWindowIsRejected) {
+  ejitIcacheClearAll();
+  EJitIcacheEpochRef windowA{}, windowB{};
+  uintptr_t cellA = 0, cellB = 0;
+
+  EXPECT_TRUE(ejitIcacheRegisterSlot(1, &cellA, 0, &windowA,
+                                     kEJitIcacheProbeAbi));
+  EXPECT_FALSE(ejitIcacheRegisterSlot(2, &cellB, 0, &windowB,
+                                      kEJitIcacheProbeAbi));
+  EXPECT_EQ(ejitIcacheBoundWindow(), &windowA) << "the first binding stands";
+
+  ejitIcacheClearAll();
+}
+
+// A declined entry is never half wired up: its cell stays null, so the taskpool
+// serves every call.
+TEST_F(SharedTaskPoolTest, DeclinedEntryLeavesNoCellWired) {
+  ejitIcacheClearAll();
+  EJitSharedTaskPool pool;
+  bringUpOwner(pool);
+  constexpr uint32_t kFunc = 6;
+  uintptr_t cell = 0;
+  void *out = nullptr;
+
+  EXPECT_FALSE(ejitIcacheRegisterSlot(kFunc, &cell, 0, nullptr, 0));
+  pool.icacheSyncEpoch();
+  pool.icacheFill(kFunc, codeFor(kFunc), nullptr, 0);
+
+  EXPECT_EQ(cell, 0u) << "a declined entry must never be filled";
+  EXPECT_FALSE(pool.icacheTry(kFunc, nullptr, 0, &out));
+
+  ejitIcacheClearAll();
+}
+
+// The drain walks only the index range this core actually filled. It must NOT
+// stop at the first zero cell: fills land at the dim identity, so a core using
+// instance 5 alone leaves 0..4 zero with a live pointer behind them.
+TEST_F(SharedTaskPoolTest, DrainClearsSparseCellsBeyondALeadingHole) {
+  ejitIcacheClearAll();
+  EJitSharedTaskPool pool;
+  bringUpOwner(pool);
+  constexpr uint32_t kFunc = 4;
+  uintptr_t cells[EJIT_ICACHE_DIM_SIZE] = {};
+  ASSERT_TRUE(registerSlot(kFunc, cells, 1));
+
+  pool.icacheSyncEpoch();
+  const EJitDimPair five[1] = {{0, 5}};
+  const EJitDimPair eleven[1] = {{0, 11}};
+  pool.icacheFill(kFunc, codeFor(kFunc), five, 1);
+  pool.icacheFill(kFunc, codeFor(kFunc + 1), eleven, 1);
+  ASSERT_NE(cells[5], 0u);
+  ASSERT_NE(cells[11], 0u);
+  ASSERT_EQ(cells[0], 0u) << "the leading hole the drain must not stop at";
+
+  pool.setInstanceEnabled(0, 5, true);
+  EXPECT_TRUE(pool.icacheSyncEpoch());
+  for (uint32_t i = 0; i < EJIT_ICACHE_DIM_SIZE; ++i)
+    EXPECT_EQ(cells[i], 0u) << "cell " << i << " survived the drain";
+
+  ejitIcacheClearAll();
+}
+
+// More distinct identities than the slot records: the drain falls back to the
+// whole array rather than clearing only the ones it remembered.
+TEST_F(SharedTaskPoolTest, DrainFallsBackWhenTheFilledListOverflows) {
+  ejitIcacheClearAll();
+  EJitSharedTaskPool pool;
+  bringUpOwner(pool);
+  constexpr uint32_t kFunc = 9;
+  // A 2D entry: 256 cells, so more distinct identities than the list holds.
+  constexpr uint32_t kUsed = EJIT_ICACHE_DRAIN_LIST + 4u;
+  static_assert(kUsed <= EJIT_ICACHE_DIM_SIZE * EJIT_ICACHE_DIM_SIZE,
+                "need more cells than the list holds to exercise the fallback");
+  uintptr_t cells[EJIT_ICACHE_DIM_SIZE][EJIT_ICACHE_DIM_SIZE] = {};
+  ASSERT_TRUE(registerSlot(kFunc, &cells[0][0], 2));
+  pool.icacheSyncEpoch();
+
+  for (uint32_t i = 0; i < kUsed; ++i) {
+    const EJitDimPair d[2] = {{0, i / EJIT_ICACHE_DIM_SIZE},
+                              {1, i % EJIT_ICACHE_DIM_SIZE}};
+    pool.icacheFill(kFunc, codeFor(kFunc + i), d, 2);
+  }
+  for (uint32_t i = 0; i < kUsed; ++i)
+    ASSERT_NE(cells[i / EJIT_ICACHE_DIM_SIZE][i % EJIT_ICACHE_DIM_SIZE], 0u)
+        << "identity " << i;
+
+  pool.setInstanceEnabled(0, 1, true);
+  EXPECT_TRUE(pool.icacheSyncEpoch());
+  for (uint32_t i = 0; i < kUsed; ++i)
+    EXPECT_EQ(cells[i / EJIT_ICACHE_DIM_SIZE][i % EJIT_ICACHE_DIM_SIZE], 0u)
+        << "identity " << i << " survived the overflow drain";
+
+  ejitIcacheClearAll();
+}
+
+// A slot with no fills since the last drain is skipped entirely, so an
+// untouched 4D entry costs nothing instead of 16^4 stores.
+TEST_F(SharedTaskPoolTest, DrainSkipsSlotsWithNoFills) {
+  ejitIcacheClearAll();
+  EJitSharedTaskPool pool;
+  bringUpOwner(pool);
+  constexpr uint32_t kFunc = 7;
+  uintptr_t cells[EJIT_ICACHE_DIM_SIZE] = {};
+  ASSERT_TRUE(registerSlot(kFunc, cells, 1));
+  pool.icacheSyncEpoch();
+
+  // Poison a cell behind the runtime's back: a drain that thinks this slot has
+  // fills would clear it, one that tracks fills correctly leaves it alone.
+  cells[3] = 0xDEADBEEF;
+  pool.setInstanceEnabled(0, 1, true);
+  EXPECT_TRUE(pool.icacheSyncEpoch());
+  EXPECT_EQ(cells[3], 0xDEADBEEFu) << "drained a slot it never filled";
+
+  // ...and once really filled, the next drain does clear it.
+  const EJitDimPair d[1] = {{0, 3}};
+  pool.icacheFill(kFunc, codeFor(kFunc), d, 1);
+  pool.setInstanceEnabled(0, 1, false);
+  EXPECT_TRUE(pool.icacheSyncEpoch());
+  EXPECT_EQ(cells[3], 0u);
 
   ejitIcacheClearAll();
 }
@@ -3478,8 +3672,8 @@ TEST_F(SharedTaskPoolTest, InlineCacheDrainCoversAllCellsAndFunctions) {
   constexpr uint32_t kFuncB = 7;
   uintptr_t cells2d[D][D] = {};
   uintptr_t cell0d = 0;
-  ejitIcacheRegisterSlot(kFuncA, &cells2d[0][0], 2);
-  ejitIcacheRegisterSlot(kFuncB, &cell0d, 0);
+  registerSlot(kFuncA, &cells2d[0][0], 2);
+  registerSlot(kFuncB, &cell0d, 0);
 
   // Fill the corners of the 2-dim array (including the LAST cell, which catches
   // a drain that under-counts the array) plus the unrelated 0-dim function.
@@ -3516,7 +3710,7 @@ TEST_F(SharedTaskPoolTest, InlineCacheDrainsAgainstADifferentBlob) {
   // Blob A: arm, warm, and leave the core's seen-epoch at A's CURRENT value.
   EJitSharedTaskPool poolA;
   bringUpOwner(poolA); // binds the fixture's state_
-  ejitIcacheRegisterSlot(kFunc, &slot, 0);
+  registerSlot(kFunc, &slot, 0);
   poolA.icacheSyncEpoch();
   poolA.icacheFill(kFunc, fn, nullptr, 0);
   ASSERT_TRUE(poolA.icacheTry(kFunc, nullptr, 0, &out));
@@ -3555,7 +3749,7 @@ TEST_F(SharedTaskPoolTest, InlineCacheDrainsAcrossAReInitialization) {
 
   EJitSharedTaskPool poolA;
   bringUpOwner(poolA);
-  ejitIcacheRegisterSlot(kFunc, &slot, 0);
+  registerSlot(kFunc, &slot, 0);
   poolA.icacheSyncEpoch();
   poolA.icacheFill(kFunc, fn, nullptr, 0);
   ASSERT_TRUE(poolA.icacheTry(kFunc, nullptr, 0, &out));
@@ -3584,7 +3778,7 @@ TEST_F(SharedTaskPoolTest, DeactivateReactivateServesTheNewSpecialization) {
   constexpr uint32_t kFunc = 3;
   constexpr uint32_t kDim = 0, kInst = 5;
   uintptr_t slot = 0;
-  ejitIcacheRegisterSlot(kFunc, &slot, 0);
+  registerSlot(kFunc, &slot, 0);
   void *fnOldValues = codeFor(kFunc);
   void *fnNewValues = codeFor(kFunc + 1);
   ASSERT_NE(fnOldValues, fnNewValues);
@@ -3629,7 +3823,7 @@ TEST_F(SharedTaskPoolTest, InlineCacheRejectsOutOfCapNumDims) {
   // A one-cell array deliberately registered with a wildly wrong shape. If
   // registration accepted it, the drain below would run off the end of it.
   uintptr_t lone = 0x1234;
-  ejitIcacheRegisterSlot(kFunc, &lone, EJIT_ICACHE_MAX_DIMS + 1u);
+  registerSlot(kFunc, &lone, EJIT_ICACHE_MAX_DIMS + 1u);
 
   void *out = nullptr;
   EXPECT_FALSE(pool.icacheTry(kFunc, nullptr, 0, &out)) << "slot must be unregistered";
@@ -3642,7 +3836,7 @@ TEST_F(SharedTaskPoolTest, InlineCacheRejectsOutOfCapNumDims) {
   // off-by-one that disables legitimate 4-dim entries.
   ejitIcacheClearAll();
   std::vector<uintptr_t> maxCells(1u << (4u * 4u), 0); // D=16 ^ 4 dims
-  ejitIcacheRegisterSlot(kFunc, maxCells.data(), EJIT_ICACHE_MAX_DIMS);
+  registerSlot(kFunc, maxCells.data(), EJIT_ICACHE_MAX_DIMS);
   pool.icacheSyncEpoch();
   EJitDimPair d4[4] = {{0, 1}, {0, 2}, {0, 3}, {0, 4}};
   pool.icacheFill(kFunc, codeFor(kFunc), d4, 4);
@@ -3664,7 +3858,7 @@ TEST_F(SharedTaskPoolTest, InlineCacheDrainStillRunsWhileAReleaserIsWired) {
   bringUpOwner(pool);
   constexpr uint32_t kFunc = 3;
   uintptr_t slot = 0;
-  ejitIcacheRegisterSlot(kFunc, &slot, 0);
+  registerSlot(kFunc, &slot, 0);
   void *out = nullptr;
 
   pool.icacheSyncEpoch();
@@ -3698,7 +3892,7 @@ TEST_F(SharedTaskPoolTest, InlineCacheSlotRegisteredAfterADrainIsUsable) {
   uintptr_t early = 0, late = 0xDEAD;
   void *out = nullptr;
 
-  ejitIcacheRegisterSlot(kEarly, &early, 0);
+  registerSlot(kEarly, &early, 0);
   pool.icacheSyncEpoch();
   pool.icacheFill(kEarly, codeFor(kEarly), nullptr, 0);
   ASSERT_TRUE(pool.icacheTry(kEarly, nullptr, 0, &out));
@@ -3708,7 +3902,7 @@ TEST_F(SharedTaskPoolTest, InlineCacheSlotRegisteredAfterADrainIsUsable) {
   EXPECT_EQ(early, 0u);
 
   // Registered only now: the drain already ran, so nothing zeroed this cell.
-  ejitIcacheRegisterSlot(kLate, &late, 0);
+  registerSlot(kLate, &late, 0);
   late = 0; // the wrapper's global is zero-initialised in .bss
   pool.icacheFill(kLate, codeFor(kLate), nullptr, 0);
   EXPECT_TRUE(pool.icacheTry(kLate, nullptr, 0, &out));
@@ -3732,7 +3926,7 @@ TEST_F(SharedTaskPoolTest, InlineCacheFillDroppedWhenAToggleRacesTheResolve) {
   bringUpOwner(pool);
   constexpr uint32_t kFunc = 3;
   uintptr_t slot = 0;
-  ejitIcacheRegisterSlot(kFunc, &slot, 0);
+  registerSlot(kFunc, &slot, 0);
   void *fn = codeFor(kFunc);
   void *out = nullptr;
 
@@ -3765,7 +3959,7 @@ TEST_F(SharedTaskPoolTest, InlineCacheResolveFillSurvivesAPendingDrain) {
   bringUpOwner(pool);
   constexpr uint32_t kFunc = 3;
   uintptr_t slot = 0;
-  ejitIcacheRegisterSlot(kFunc, &slot, 0);
+  registerSlot(kFunc, &slot, 0);
   void *stale = codeFor(kFunc);
   void *fresh = codeFor(kFunc + 1);
   void *out = nullptr;
@@ -3845,7 +4039,7 @@ TEST_F(SharedTaskPoolTest, IcacheEpochRefDivergesOnToggleWithoutAnySync) {
   bringUpOwner(pool);
   constexpr uint32_t kFunc = 11;
   uintptr_t slot = 0;
-  ejitIcacheRegisterSlot(kFunc, &slot, 0);
+  registerSlot(kFunc, &slot, 0);
 
   pool.icacheSyncEpoch();
   pool.icacheFill(kFunc, codeFor(kFunc), nullptr, 0);
