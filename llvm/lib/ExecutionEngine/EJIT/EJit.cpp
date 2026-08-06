@@ -235,10 +235,17 @@ EJit::EJit(const Config &config) : config_(config) {
           }
           // name2 carries the probe's epoch window (see
           // ejitIcacheBindEpochWindow). Binding by address is what guarantees
-          // the runtime writes the bytes the probe reads.
-          if (e->name2)
-            ejitIcacheBindEpochWindow(
-                const_cast<void *>(static_cast<const void *>(e->name2)));
+          // the runtime writes the bytes the probe reads. Not optional: the
+          // probe reads the window with no null check, so registering the slot
+          // without one turns the first hit into a null dereference.
+          if (!e->name2) {
+            EJIT_DIAG("icache DISABLED for %s: registry entry carries no epoch "
+                      "window (malformed object)",
+                      e->name1);
+            break;
+          }
+          ejitIcacheBindEpochWindow(
+              const_cast<void *>(static_cast<const void *>(e->name2)));
           uint32_t idx = EJitFuncRegistry::instance().resolveAssign(e->name1);
           if (idx != kEJitInvalidFuncIndex)
             ejitIcacheRegisterSlot(idx, const_cast<void *>(e->ptr), numDims);

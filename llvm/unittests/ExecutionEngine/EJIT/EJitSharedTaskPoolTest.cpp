@@ -3383,13 +3383,60 @@ TEST_F(SharedTaskPoolTest, InlineCacheDrainsOnPeriodToggle) {
   EXPECT_TRUE(pool.icacheSyncEpoch());
   EXPECT_FALSE(pool.icacheTry(kFunc, nullptr, 0, &out));
 
-  // A rejected toggle (already in that state) does NOT bump the epoch, so it
-  // does not cost a spurious drain.
+  // A toggle that does not move the BIT still drains: it is a second core
+  // bracketing its own period writes over the shared bit -- see
+  // TwoCoresReconfiguringBothInvalidate.
   pool.icacheFill(kFunc, fn, nullptr, 0);
-  EXPECT_FALSE(pool.setInstanceEnabled(0, 5, false)); // already disabled
-  EXPECT_FALSE(pool.icacheSyncEpoch());
-  EXPECT_TRUE(pool.icacheTry(kFunc, nullptr, 0, &out));
-  EXPECT_EQ(out, fn);
+  EXPECT_FALSE(pool.setInstanceEnabled(0, 5, false)); // bit already 0 ...
+  EXPECT_TRUE(pool.icacheSyncEpoch());                // ... but still published
+  EXPECT_FALSE(pool.icacheTry(kFunc, nullptr, 0, &out));
+  EXPECT_EQ(out, nullptr);
+
+  ejitIcacheClearAll();
+}
+
+// Why the drain above is not gated on the enabled bit moving.
+//
+// Period DATA is core-private; the specialization compiled from it is SHARED, so
+// every core brackets its own writes over one shared enabled bit and only the
+// first in each direction wins the CAS. Publishing on the transition alone loses
+// every other core: their writes land in a window nothing announced, and they
+// keep being served a peer's pre-write values -- silently, forever.
+TEST_F(SharedTaskPoolTest, TwoCoresReconfiguringBothInvalidate) {
+  ejitIcacheClearAll();
+  EJitSharedTaskPool pool;
+  bringUpOwner(pool);
+  constexpr uint32_t kDim = 0, kInst = 5, kFunc = 9;
+  uintptr_t slot = 0;
+  ejitIcacheRegisterSlot(kFunc, &slot, 0);
+  void *fn = codeFor(kFunc);
+  void *out = nullptr;
+
+  ASSERT_TRUE(pool.setInstanceEnabled(kDim, kInst, true)); // steady state
+  pool.icacheSyncEpoch();
+  pool.icacheFill(kFunc, fn, nullptr, 0);
+  ASSERT_TRUE(pool.icacheTry(kFunc, nullptr, 0, &out));
+
+  // Interleave two cores exactly as the SRE reconfiguration path does. Core A
+  // wins both CASes; core B loses both, and it is core B's write (between the
+  // two calls it makes) that must still be announced.
+  const uint32_t v0 = pool.state()->version[kDim][kInst].loadAcquire();
+  EXPECT_TRUE(pool.setInstanceEnabled(kDim, kInst, false));  // core A deactivate
+  EXPECT_FALSE(pool.setInstanceEnabled(kDim, kInst, false)); // core B deactivate
+  EXPECT_TRUE(pool.setInstanceEnabled(kDim, kInst, true));   // core A activate
+  // ... core B writes ITS copy of the period values here ...
+  const uint32_t vBeforeB = pool.state()->version[kDim][kInst].loadAcquire();
+  EXPECT_FALSE(pool.setInstanceEnabled(kDim, kInst, true)); // core B activate
+
+  // Core B's bracket moved the version, so a specialization compiled against
+  // anything core A published is rejected by versionsCurrent ...
+  EXPECT_GT(pool.state()->version[kDim][kInst].loadAcquire(), vBeforeB)
+      << "core B's reconfiguration never reached the taskpool";
+  EXPECT_GT(pool.state()->version[kDim][kInst].loadAcquire(), v0);
+  // ... and it moved the icache epoch, so every core drains its cells.
+  EXPECT_TRUE(pool.icacheSyncEpoch());
+  EXPECT_FALSE(pool.icacheTry(kFunc, nullptr, 0, &out));
+  EXPECT_EQ(slot, 0u);
 
   ejitIcacheClearAll();
 }

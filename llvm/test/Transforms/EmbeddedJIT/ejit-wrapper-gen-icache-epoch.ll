@@ -51,6 +51,15 @@
 ; previous specialization, so no atomic/acquire is emitted.
 ; CHECK-NOT: load atomic
 
+; The CONSTRUCTOR path must carry the same two facts: the static registry above
+; is only walked when forceStaticRegistry is set or the constructor produced
+; nothing, so a default init sees ONLY these calls. Without the window, cells
+; fill normally while `shared` stays null and the first hit faults. The runtime
+; declines a slot it has no window for, hence the window is registered FIRST.
+; CHECK-LABEL: define internal void @ejit_auto_register()
+; CHECK: call void @ejit_register_icache_epoch(ptr @__ejit_icache_epoch, i32 2)
+; CHECK-NEXT: call void @ejit_register_icache_slot(ptr {{.*}}, ptr @__ejit_icache_fn_dim_entry, i32 1)
+
 ; Flag off: no probe, so nothing reads the epoch and the symbol never appears.
 ; OFF-NOT: __ejit_icache_epoch
 ; OFF-NOT: jit_icache_epoch

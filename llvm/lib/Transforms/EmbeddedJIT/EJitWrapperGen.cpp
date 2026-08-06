@@ -429,6 +429,10 @@ emitIcacheSlotRegistration(Module &M,
   M.getOrInsertFunction(
       FN_REGISTER_ICACHE_SLOT,
       FunctionType::get(Type::getVoidTy(Ctx), {PtrTy, PtrTy, I32Ty}, false));
+  // void ejit_register_icache_epoch(void *window, uint32_t probeAbi)
+  M.getOrInsertFunction(
+      FN_REGISTER_ICACHE_EPOCH,
+      FunctionType::get(Type::getVoidTy(Ctx), {PtrTy, I32Ty}, false));
 
   Function *AutoReg = M.getFunction(FN_AUTO_REGISTER);
   bool CreatedAutoReg = false;
@@ -441,6 +445,16 @@ emitIcacheSlotRegistration(Module &M,
     CreatedAutoReg = true;
   }
   Instruction *Ret = AutoReg->getEntryBlock().getTerminator();
+  // The window FIRST: the runtime declines a slot it has no window for. This is
+  // the constructor path's counterpart of the name2/size fields the static
+  // registry entries below carry.
+  {
+    IRBuilder<> Builder(Ret);
+    Builder.CreateCall(
+        M.getFunction(FN_REGISTER_ICACHE_EPOCH),
+        {ConstantExpr::getBitCast(getOrCreateIcacheEpochGlobal(M), PtrTy),
+         ConstantInt::get(I32Ty, kEJitIcacheProbeAbi)});
+  }
   FunctionCallee FnReg = M.getFunction(FN_REGISTER_ICACHE_SLOT);
   for (auto &KV : Fns) {
     IRBuilder<> Builder(Ret);

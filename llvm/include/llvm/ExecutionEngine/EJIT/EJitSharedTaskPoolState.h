@@ -343,7 +343,10 @@ struct alignas(kEJitSharedCacheLine) EJitSharedTaskPoolState {
       EJitAtomicU8 enabled[kEJitSharedDimTypes][kEJitSharedInstances];
   EJitAtomicU32 version[kEJitSharedDimTypes][kEJitSharedInstances];
   EJitAtomicU32 mode; ///< EJitCompileMode (Off=0, Async=1)
-  EJitAtomicU32 icacheEpoch; ///< bumped by every setInstanceEnabled transition.
+  EJitAtomicU32 icacheEpoch; ///< bumped by every setInstanceEnabled CALL, not
+                             ///< only the one that moves the bit: only the
+                             ///< first of N cores wins the CAS, so the rest
+                             ///< would go unannounced.
                              ///< The inline cache stores a bare fnPtr with no
                              ///< version, so an activate/deactivate cannot
                              ///< invalidate individual cells; each core instead

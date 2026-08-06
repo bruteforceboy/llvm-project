@@ -381,9 +381,49 @@ void ejit_register_icache_slot(const char *funcName, void *slot,
               funcName);
     return;
   }
+#ifdef EJIT_SRE_SHARED_TASKPOOL
+  // The probe reads the epoch window with no null check, on the strength of "a
+  // non-null cell implies registration implies a bound window". Wiring up a cell
+  // before the window exists breaks that as a fault on the first hit, not as a
+  // miss, so decline instead.
+  if (!ejitIcacheEpochWindowBound()) {
+    EJitRegistrationStore::instance().recordError(
+        EJIT_ERR_INVALID_PARAM,
+        "icache slot registered before its epoch window (object needs "
+        "ejit_register_icache_epoch, or its probe ABI was rejected)",
+        funcName);
+    EJIT_DIAG("register_icache_slot reject name=%s: no epoch window bound "
+              "(inline cache stays off; calls resolve through the taskpool)",
+              funcName);
+    return;
+  }
+#endif
   ejitIcacheRegisterSlot(idx, slot, numDims);
   EJIT_DIAG_VERBOSE("register_icache_slot OK name=%s idx=%u numDims=%u",
                     funcName, idx, numDims);
+}
+
+void ejit_register_icache_epoch(void *window, uint32_t probeAbi) {
+#ifdef EJIT_SRE_SHARED_TASKPOOL
+  if (!window) {
+    EJIT_DIAG("register_icache_epoch reject: null window");
+    return;
+  }
+  if (probeAbi < kEJitIcacheProbeAbi) {
+    // Leaving the window unbound makes every following slot registration
+    // decline, so cells stay null and all calls miss to the taskpool. Correct,
+    // unlike a probe that cannot see a period toggle.
+    EJIT_DIAG("icache DISABLED: probe ABI %u < %u (object predates the "
+              "shared-epoch check -- rebuild it with THIS clang; the runtime "
+              "alone is not enough)",
+              probeAbi, static_cast<unsigned>(kEJitIcacheProbeAbi));
+    return;
+  }
+  ejitIcacheBindEpochWindow(window);
+#else
+  (void)window;
+  (void)probeAbi;
+#endif
 }
 
 namespace {

@@ -88,6 +88,13 @@ constexpr const char *FN_REGISTER_FUNCINDEX = "ejit_register_funcindex";
 // ejit_icache_try call - so the hit path is one load + null-check + indirect
 // call. Signature: void ejit_register_icache_slot(const char *name, void *slot).
 constexpr const char *FN_REGISTER_ICACHE_SLOT = "ejit_register_icache_slot";
+// Hands the AOT-emitted @__ejit_icache_epoch window to the runtime plus the
+// probe contract version. Emitted into ejit_auto_register BEFORE any
+// ejit_register_icache_slot call: the runtime declines a slot whose window it
+// has not been given. The static .ejit_period registry carries the same two
+// facts in the icache entry's name2 / size fields.
+// Signature: void ejit_register_icache_epoch(void *window, uint32_t probeAbi).
+constexpr const char *FN_REGISTER_ICACHE_EPOCH = "ejit_register_icache_epoch";
 
 // Contract version between the AOT-emitted inline-cache probe and the runtime.
 // Bumped whenever the probe's obligations change, and stamped into the high 32

@@ -198,6 +198,8 @@ void llvm::ejit::ejitIcacheBindEpochWindow(void *window) {
   EJIT_DIAG_VERBOSE("icache epoch window bound: %p", window);
 }
 
+bool llvm::ejit::ejitIcacheEpochWindowBound() { return gProbeEpoch != nullptr; }
+
 void llvm::ejit::ejitIcacheRegisterSlot(uint32_t funcIndex, void *base,
                                         uint32_t numDims) {
   if (funcIndex >= EJIT_ICACHE_FUNC_SLOTS || !base)
@@ -526,21 +528,25 @@ bool EJitSharedTaskPool::setInstanceEnabled(uint32_t dimType,
   }
   uint8_t expected = enabled ? 0 : 1;
   uint8_t desired = enabled ? 1 : 0;
-  if (state_->enabled[dimType][instanceId].compareExchange(expected, desired)) {
-    state_->version[dimType][instanceId].fetchAdd(1);
-    // Neither the L0 nor the inline cache stores a version, so the bump above
-    // is invisible to both: each has its own epoch to drain against.
-    state_->dispatchEpoch.fetchAdd(1);
-    state_->icacheEpoch.fetchAdd(1);
-    // Latch on the first successful enable of ANY instance: this brackets the
-    // init→activate window during which instanceDisabled hits are tallied
-    // separately (instanceDisabledPreActivate) for diagnosing the pre-activate
-    // fallback storm. Once latched it stays 1 until the next (re)initialization.
-    if (enabled)
-      state_->anyInstanceActivated.storeRelease(1);
-    return true;
-  }
-  return false;
+  const bool flipped =
+      state_->enabled[dimType][instanceId].compareExchange(expected, desired);
+
+  // Publish UNCONDITIONALLY -- see the header. The CAS owns the shared compile
+  // gate; the version and epochs answer "could a cached specialization have been
+  // baked from values that have since changed?", and for a caller that lost the
+  // CAS that is still yes -- it has its own core-private copy to rewrite.
+  state_->version[dimType][instanceId].fetchAdd(1);
+  // Neither the L0 nor the inline cache stores a version, so the bump above is
+  // invisible to both: each has its own epoch to drain against.
+  state_->dispatchEpoch.fetchAdd(1);
+  state_->icacheEpoch.fetchAdd(1);
+  // Latch on the first enable of ANY instance: this brackets the init→activate
+  // window during which instanceDisabled hits are tallied separately
+  // (instanceDisabledPreActivate) for diagnosing the pre-activate fallback
+  // storm. Once latched it stays 1 until the next (re)initialization.
+  if (enabled)
+    state_->anyInstanceActivated.storeRelease(1);
+  return flipped;
 }
 
 bool EJitSharedTaskPool::versionsCurrent(const EJitCompileRequest &req) const {

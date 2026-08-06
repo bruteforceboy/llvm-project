@@ -163,6 +163,14 @@ struct EJitIcacheEpochRef {
 /// stale cell. Binding by address makes them the same bytes by construction.
 void ejitIcacheBindEpochWindow(void *window);
 
+/// Whether a probe window has been bound on this core.
+///
+/// The probe reads `shared` WITHOUT a null check, on the strength of "a non-null
+/// cell implies a fill, hence registration, hence a bound window". That only
+/// holds if no registration path can wire a cell up without handing over the
+/// window, so ejit_register_icache_slot() consults this and declines otherwise.
+bool ejitIcacheEpochWindowBound();
+
 // Test/diagnostic: clear every icache slot. The slot-pointer table is
 // process-static storage shared across pool instances, so tests clear it
 // between cases to avoid stale cross-test leakage.
@@ -626,6 +634,19 @@ public:
                                    uint32_t inst2, uint32_t dim3,
                                    uint32_t inst3);
   void releaseRead(uint32_t bucketIndex);
+  /// Drive one end of a period-value mutation window for a lifecycle instance.
+  ///
+  /// Two facts here must not be conflated: the shared `enabled` bit is the JIT
+  /// compile gate and is CAS'd, so only the first caller in each direction moves
+  /// it; the version and the two epochs instead say "the values under this
+  /// instance may now differ from what a cached specialization was baked with",
+  /// which is true for EVERY caller. Period data is core-private while the
+  /// specialization is SHARED, so N cores each bracket their own writes over the
+  /// one shared bit - publishing only on the transition loses every core but the
+  /// first, and their writes land in a window nothing announced.
+  ///
+  /// \returns whether the enabled BIT flipped. The publication happens either
+  /// way.
   bool setInstanceEnabled(uint32_t dimType, uint32_t instanceId, bool enabled);
   /// Query the shared activation bit for a lifecycle instance — the read
   /// counterpart of setInstanceEnabled, and the single cross-core source of

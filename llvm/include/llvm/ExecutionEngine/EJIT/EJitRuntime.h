@@ -162,9 +162,22 @@ void ejit_register_funcindex(const char *funcName, uint32_t *slotOut);
 // indirect call, no ejit_icache_try call). Keys the slot by the SAME registry
 // funcIndex assigned by ejit_register_funcindex. Called by AOT auto-registration.
 // A null slot or capacity exhaustion is recorded; the base stays null and the
-// probe misses.
+// probe misses. Also declined when no epoch window has been registered yet (see
+// ejit_register_icache_epoch): the probe reads the window without a null check,
+// so a wired-up cell with no window behind it faults on the first hit.
 void ejit_register_icache_slot(const char *funcName, void *slot,
                                uint32_t numDims);
+
+// Hand over the AOT-emitted @__ejit_icache_epoch window (the { seen, shared }
+// pair the probe compares on every call) and the probe contract version the
+// object was built against. Emitted by AOT auto-registration before the slot
+// registrations. Passing the window by ADDRESS is what guarantees the runtime
+// writes the bytes the probe reads - see ejitIcacheBindEpochWindow.
+//
+// A \p probeAbi below kEJitIcacheProbeAbi leaves the window unbound, which makes
+// every later ejit_register_icache_slot decline: the inline cache stays off and
+// all calls resolve through the taskpool - correct, just without the fast path.
+void ejit_register_icache_epoch(void *window, uint32_t probeAbi);
 
 // Bring the CALLING core's inline cache up to date, dropping every cached
 // specialization if a period toggled since this core last synced. Cheap when
