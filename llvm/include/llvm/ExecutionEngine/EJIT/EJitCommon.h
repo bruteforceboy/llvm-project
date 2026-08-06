@@ -84,9 +84,10 @@ constexpr const char *FN_REGISTER_FUNCINDEX = "ejit_register_funcindex";
 // Per-function inline-cache slot registration: the wrapper's per-function
 // @__ejit_icache_fn_<name> global (a frozen, sticky specialization pointer) is
 // registered by name so the runtime can backfill it on a successful resolve
-// (icacheFill). The wrapper reads it directly with an inline atomic load - no
-// ejit_icache_try call - so the hit path is one load + null-check + indirect
-// call. Signature: void ejit_register_icache_slot(const char *name, void *slot).
+// (icacheFill). The wrapper reads it directly with an inline plain load - no
+// ejit_icache_try call - so the hit path is one load + null-check, the
+// shared-epoch check, then the indirect call.
+// Signature: void ejit_register_icache_slot(const char *name, void *slot).
 constexpr const char *FN_REGISTER_ICACHE_SLOT = "ejit_register_icache_slot";
 // Hands the AOT-emitted @__ejit_icache_epoch window to the runtime plus the
 // probe contract version. Emitted into ejit_auto_register BEFORE any

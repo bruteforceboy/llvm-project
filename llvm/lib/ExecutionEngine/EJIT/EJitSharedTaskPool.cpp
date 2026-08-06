@@ -342,9 +342,10 @@ uint32_t EJitSharedTaskPool::instanceVersion(uint32_t dimType,
 //
 // The production hit path does NOT call icacheTry: the ejit_entry wrapper reads
 // its own @__ejit_icache_fn_<name> global directly (GEP into the [D]^numDims
-// array by the ejit_dim arg values + acquire load + null check + indirect call,
-// no call, no per-call guards). icacheTry is retained for unit tests and
-// diagnostics. icacheFill writes the specialization pointer through the cell at
+// array by the ejit_dim arg values + plain load + null check, the shared-epoch
+// check, then the indirect call; no call, no per-call guards). icacheTry is
+// retained for unit tests and diagnostics.
+// icacheFill writes the specialization pointer through the cell at
 // [i0][i1]... (linearized from dims) on a successful resolve; it is a frozen,
 // one-shot fill PER CELL - each identity's cell is written once and never
 // refilled, so a cell's pointer is always the correct (invariant) specialization

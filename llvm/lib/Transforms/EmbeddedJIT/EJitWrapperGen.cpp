@@ -57,9 +57,10 @@ static cl::opt<bool> EJitWrapperTiming(
 
 // Emit a per-function inline-cache probe DIRECTLY in the ejit_entry wrapper
 // (not a call). On a hit the wrapper loads its per-function @__ejit_icache_fn_
-// <name> slot (one atomic acquire load), null-checks it, and tail-calls the
-// cached specialization - NO ejit_icache_try call, NO read-token, NO per-call
-// guards, NO funcIndex/IdxValid on the hit path. Just "pointer non-null? jump".
+// <name> slot (one plain load), null-checks it, confirms the shared epoch has
+// not moved since this core last drained, and tail-calls the cached
+// specialization - NO ejit_icache_try call, NO read-token, NO per-call guards,
+// NO funcIndex/IdxValid on the hit path.
 // On a miss it falls through to jit_slow -> ejit_taskpool_compile_or_get, which
 // fills the slot on success (icacheFill). v2: sticky monomorphic - the slot is
 // filled once (first resolution) and read forever, so the probe needs no
@@ -250,10 +251,11 @@ struct IcacheSlotInfo {
 // Per-function pointer-typed global holding the frozen inline-cache slot: the
 // specialization pointer once resolved, null until then. Internal linkage (each
 // module's copy is wired into the runtime slot-pointer table by name at
-// registration). 8-byte aligned so the atomic acquire load / one-shot CAS the
-// runtime pairs against it are lock-free on aarch64. The wrapper reads it
-// DIRECTLY (load atomic acquire + null-check + indirect call) - no
-// ejit_icache_try call, no per-call guards - so the hit path is one load.
+// registration). 8-byte aligned so the load is a single lock-free access on
+// aarch64. The wrapper reads it DIRECTLY (plain load + null-check, then the
+// shared-epoch check, then the indirect call) - no ejit_icache_try call, no
+// per-call guards. The cell is core-private, so the fill and the read are
+// same-core and no atomic/acquire is needed.
 //
 // Multi-version: the global is a [D]^NumDims array (D = EJIT_ICACHE_DIM_SIZE,
 // power-of-2) indexed by the ejit_dim argument values, so each dim identity
@@ -315,7 +317,6 @@ static GlobalVariable *getOrCreateIcacheEpochGlobal(Module &M) {
     return Existing;
   }
   LLVMContext &Ctx = M.getContext();
-  auto *I32Ty = Type::getInt32Ty(Ctx);
   auto *PtrTy = PointerType::getUnqual(Ctx);
   auto *I64Ty = Type::getInt64Ty(Ctx);
   auto *Ty = StructType::get(Ctx, {I64Ty, PtrTy});
@@ -541,8 +542,9 @@ PreservedAnalyses EJitWrapperGenPass::run(Module &M,
       FN_TASKPOOL_RELEASE_READ,
       FunctionType::get(Type::getVoidTy(Ctx), {I32Ty}, false));
   // With -ejit-inline-cache the wrapper reads its per-function
-  // @__ejit_icache_fn_<name> slot directly (one atomic load + null-check +
-  // indirect call) - no ejit_icache_try call, no per-call guards.
+  // @__ejit_icache_fn_<name> slot directly (one plain load + null-check, the
+  // shared-epoch check, then the indirect call) - no ejit_icache_try call, no
+  // per-call guards.
 
   auto isAlreadyWrapped = [](Function &F) -> bool {
     if (!F.getEntryBlock().getName().starts_with("jit_entry"))

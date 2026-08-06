@@ -86,7 +86,7 @@ enum class EJitWorkerStep : uint32_t {
 //
 // A cell per (funcIndex, dim identity) holding a specialization pointer, read
 // with no version / dims / generation re-validation and no release_read - the
-// probe is a single load + null check.
+// probe is a plain load + null check, then the epoch check below.
 //
 // A cell therefore cannot be invalidated in place. Instead an activate or
 // deactivate bumps the shared icacheEpoch, and each core drains its whole table
@@ -137,9 +137,10 @@ enum class EJitWorkerStep : uint32_t {
 // only publish. Having the READER consult shared memory inverts that, so a core
 // that always hits still observes the toggle without cooperating.
 //
-// `shared` is bound when the pool binds its state, and is null before that. The
-// probe checks the cell FIRST: a non-null cell implies a fill, hence
-// registration, hence `shared` is bound -- so no null check is needed.
+// `shared` is bound by the first icacheSyncEpoch() on this core, and is null
+// before that. The probe checks the cell FIRST: a non-null cell implies a fill,
+// every fill is preceded by a sync on the same core, so `shared` is bound by
+// then -- which is why the probe needs no null check on it.
 //
 // Both loads are plain: a stale read costs at most one more call into the
 // previous specialization, the same window a racing drain already has.
@@ -658,10 +659,11 @@ public:
   // NOTE: the production hit path does NOT use icacheTry. With -ejit-inline-cache
   // the ejit_entry wrapper reads its per-function @__ejit_icache_fn_<name> slot
   // directly - a GEP into the [D]^numDims array by the ejit_dim arg values, one
-  // acquire load + null-check + indirect call, NO ejit_icache_try call, NO
-  // per-call guards. icacheTry is retained for unit tests / diagnostics: on a
-  // hit it sets *outFn to the frozen specialization for the given dims (call
-  // with NO releaseRead) and returns true; on a miss returns false. It keeps
+  // plain load + null-check, the shared-epoch check, then the indirect call. NO
+  // ejit_icache_try call, NO per-call guards. icacheTry is retained for unit
+  // tests / diagnostics: on a hit it sets *outFn to the frozen specialization
+  // for the given dims (call with NO releaseRead) and returns true; on a miss
+  // returns false. It keeps
   // the reclamation-safety, pool-Ready, range, and cross-core code-sharing gates
   // (the latter matters in non-shared test builds; the wrapper's inline probe is
   // only enabled under EJIT_SRE_SHARED_CODE_POINTERS, where the gate is

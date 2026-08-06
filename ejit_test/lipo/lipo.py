@@ -388,7 +388,7 @@ def doit_gc_merge(args):
         # the app object's reference is anchored by .init_array, so the SRE link
         # then fails on an undefined symbol. The production wrapper reads
         # @__ejit_icache_fn_<name> directly (no ejit_icache_try call).
-        # ejitIcacheRegisterSlot/gIcacheFnSlots are reachable from these roots +
+        # ejitIcacheRegisterSlot/gIcacheSlots are reachable from these roots +
         # ejit_init's .ejit_period walk, no explicit root needed.
         "ejit_register_icache_slot",
         "ejit_register_icache_epoch",
