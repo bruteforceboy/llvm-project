@@ -41,6 +41,24 @@ public:
   /// to avoid dangling pointers to IR units from previous modules.
   void clearAnalyses();
 
+  /// Drop everything the specialization being compiled cannot reach.
+  ///
+  /// AOT bitcode is emitted per translation unit, so one blob is shared by
+  /// every ejit_entry in a file — but a compile specializes exactly one of
+  /// them, and that entry's symbol is the only one ever looked up in the
+  /// resulting module. Left alone, every other entry (and its whole AOT body)
+  /// is optimized and object-emitted again on every compile, making cold-compile
+  /// time scale with the size of the FILE rather than of the function. Give the
+  /// other entries local linkage so they have no external reason to live, then
+  /// let GlobalDCE delete them and everything only they reached.
+  ///
+  /// MUST run before the module is handed to ORC. addIRModule records the
+  /// module's external definitions as the symbols its materializer promises to
+  /// deliver; deleting one after that point fails materialization for a symbol
+  /// nothing asked for. \p EntryName is left untouched, and if it names no
+  /// definition in \p M the module is left exactly as it was.
+  void pruneToEntry(Module &M, StringRef EntryName);
+
 private:
   /// Replace ejit_period_arr_ind parameters with their runtime constants.
   void preReplacePeriodIndices(Module &M, const SpecializationContext &ctx);

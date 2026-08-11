@@ -192,6 +192,8 @@ ALL_TESTS=(
   ejit_trace_test
   ejit_volatile_test
   ejit_l0_dispatch_test
+  ejit_tusize_bench
+  ejit_pipeline_bench
 )
 
 # Per-test compile flags (e.g. for disabling global constructors)
@@ -249,6 +251,12 @@ TEST_ARGS[ejit_baremetal_link_test]="0 3"
 TEST_ARGS[ejit_sync_mode_test]="0"
 TEST_ARGS[ejit_new_attr_test]="0"
 TEST_ARGS[ejit_fixed_dim_test]="0 1"
+# The two benches double as regression tests: both fail the run if the taskpool
+# reports no compiles (silent AOT), and ejit_pipeline_bench also fails if a
+# specialized result disagrees with AOT. Shortened arguments keep them at a few
+# seconds inside the suite; run them by hand with larger ones to benchmark.
+TEST_ARGS[ejit_tusize_bench]="8"
+TEST_ARGS[ejit_pipeline_bench]="200000 8"
 
 if [[ ${#SELECTED[@]} -eq 0 ]]; then
   SELECTED=("${ALL_TESTS[@]}")
@@ -268,7 +276,10 @@ build_one() {
   fi
 
   echo "  Compiling $(basename "${src}") ..."
-  local extra_flags="${COMPILE_FLAGS[${name}]:-}"
+  # EJIT_EXTRA_CFLAGS lets a caller append flags to every TU without editing the
+  # per-test COMPILE_FLAGS table — used to build one benchmark source at several
+  # -D configurations for A/B comparison.
+  local extra_flags="${COMPILE_FLAGS[${name}]:-} ${EJIT_EXTRA_CFLAGS:-}"
   "${CLANG}" -O2 ${INCLUDES} ${extra_flags} ${EJIT_SRE_CFLAGS} -c "${src}" -o "${obj}"
 
   # Compile any extra translation units (multi-TU tests) and link them all.

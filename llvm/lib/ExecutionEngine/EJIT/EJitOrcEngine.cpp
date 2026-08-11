@@ -817,6 +817,17 @@ Error EJitOrcEngine::loadBitcodeModule(StringRef bitcodeData,
     if (!EntryF->isDeclaration() && EntryF->hasLocalLinkage())
       EntryF->setLinkage(GlobalValue::ExternalLinkage);
 
+  // Reduce this per-TU module to the one entry being specialized before ORC
+  // sees it. Every sibling ejit_entry is compiled by its own separate request
+  // into its own JITDylib, so carrying them here only means optimizing and
+  // object-emitting their bodies again on every compile. This runs before
+  // addIRModule (which freezes the promised symbol set) and before the external
+  // symbol collection below, so the pruned-away references are not resolved
+  // either. Ordering note: it must come after the linkage fixup above, so a
+  // `static` ejit_entry is already external and is recognized as the entry.
+  if (P->optimizer)
+    P->optimizer->pruneToEntry(**ModuleOrErr, origFnName);
+
   // Collect global variable addresses from the registry for symbols
   // that appear as external declarations in the bitcode module.
   orc::SymbolMap globalSymbols;

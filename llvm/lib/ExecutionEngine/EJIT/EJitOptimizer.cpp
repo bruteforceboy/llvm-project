@@ -13,6 +13,7 @@
 // pipeline (PassBuilder::buildFunctionSimplificationPipeline); only the light
 // cleanupFPM_ and the LowerExpect prefix are hand-added below.
 #include "llvm/Transforms/InstCombine/InstCombine.h"
+#include "llvm/Transforms/IPO/GlobalDCE.h"
 #include "llvm/Transforms/IPO/SCCP.h"
 #include "llvm/Transforms/Scalar/ADCE.h"
 #include "llvm/Transforms/Scalar/LowerExpectIntrinsic.h"
@@ -163,6 +164,49 @@ void EJitOptimizer::preReplacePeriodIndices(
       }
     }
   }
+}
+
+void EJitOptimizer::pruneToEntry(Module &M, StringRef EntryName) {
+  // Only EntryName is looked up in this module (EJitCompileDriver::compileCold
+  // -> jitEngine_->lookup(cacheKey, funcName)). If it is missing, the module is
+  // not shaped the way this assumes — leave it entirely alone rather than risk
+  // internalizing the symbol the lookup needs.
+  Function *Entry = M.getFunction(EntryName);
+  if (!Entry || Entry->isDeclaration())
+    return;
+
+  bool Changed = false;
+  for (Function &F : M.functions()) {
+    if (&F == Entry || F.isDeclaration() || F.hasLocalLinkage())
+      continue;
+    // Only the sibling ejit_entry functions are dropped here. Other external
+    // definitions are the entry's potential callees; phase 1d internalizes
+    // those for IPSCCP, and GlobalDCE below removes the ones nothing calls.
+    if (!hasMDStringEntry(F.getMetadata(MD_EJIT_METADATA), TAG_EJIT_ENTRY))
+      continue;
+    // The IR verifier requires default visibility with local linkage.
+    F.setVisibility(GlobalValue::DefaultVisibility);
+    F.setLinkage(GlobalValue::InternalLinkage);
+    Changed = true;
+  }
+  if (!Changed)
+    return;
+
+  // GlobalDCE deletes the now-unreferenced siblings. Globals the entry still
+  // reads keep external linkage and are untouched — they must stay, since they
+  // resolve to the AOT process addresses the specialization reads through.
+  //
+  // Deliberately run against a LOCAL analysis manager, not the member MAM_.
+  // This runs at module-load time, outside the clearAnalyses() discipline that
+  // brackets runPipeline, so seeding the shared managers here would leave
+  // cached results computed on the pre-prune module for the pipeline to reuse.
+  // GlobalDCE requires no analyses, so a fresh empty manager costs nothing.
+  ModuleAnalysisManager MAM;
+  PassBuilder PB;
+  PB.registerModuleAnalyses(MAM);
+  ModulePassManager MPM;
+  MPM.addPass(GlobalDCEPass());
+  MPM.run(M, MAM);
 }
 
 void EJitOptimizer::runInstCombine(Module &M) {
