@@ -152,18 +152,41 @@ constexpr uint64_t kHashMul = 0x9e3779b97f4a7c15ULL;
 struct EJitIcacheSlotReg {
   uintptr_t *base;
   uint32_t numDims;
-  // The cells this core has written since its last drain, so the drain clears
-  // exactly those. Fills land at icacheLinearize(dims), i.e. sparsely at
-  // whichever dim identities this core calls: a drain can neither stop at the
-  // first zero cell (identity 5 alone leaves 0..4 zero) nor bound itself to
-  // [min,max] cheaply -- identities 0 and 15 of a 4D entry span the whole
-  // 65536-cell array. Recording the indices costs one store on the miss path
-  // and makes the drain O(identities this core actually used), which is 1 for
-  // the usual one-identity-per-core shape.
-  uint32_t fills;                          // 0 = nothing to clear
-  uint32_t filled[EJIT_ICACHE_DRAIN_LIST]; // valid while fills <= the cap
+  // Nonzero once this core writes any cell of this slot, cleared by the drain.
+  // Only a flag: the cell indices live in the one global gIcacheDirty log
+  // below, not here. Kept per slot so the overflow path can skip untouched
+  // entries instead of whole-array clearing a 65536-cell 4D slot for nothing.
+  uint32_t touched;
 };
+// 16 bytes x EJIT_ICACHE_FUNC_SLOTS (4096) = 64KB of core-private BSS. The
+// funcIndex space is dense, so this table is sized for EVERY entry in the image
+// while only the handful a core actually calls are ever non-null -- which is
+// why the recorded cell indices must NOT live in here. Reserving a per-slot
+// drain list costs its size x 4096 no matter how few slots are used (a 16-entry
+// list would add 64B x 4096 = 256KB); the global log below costs its size once.
 EJitIcacheSlotReg gIcacheSlots[EJIT_ICACHE_FUNC_SLOTS];
+
+// The cells this core has written since its last drain, so the drain clears
+// exactly those. Fills land at icacheLinearize(dims), i.e. sparsely at whichever
+// dim identities this core calls: a drain can neither stop at the first zero
+// cell (identity 5 alone leaves 0..4 zero) nor bound itself to [min,max] cheaply
+// -- identities 0 and 15 of a 4D entry span the whole 65536-cell array.
+// Recording (slot, cell) costs one store on the miss path and makes the drain
+// O(cells this core actually filled) -- typically one per hot entry -- instead
+// of a walk over all EJIT_ICACHE_FUNC_SLOTS entries.
+//
+// One log for all slots, because demand is global and tiny: a core fills a cell
+// only on a taskpool resolve, so the total between two drains is bounded by the
+// entries it actually calls, not by the size of the slot table.
+struct EJitIcacheDirtyEnt {
+  uint32_t funcIndex;
+  uint32_t cell;
+};
+EJitIcacheDirtyEnt gIcacheDirty[EJIT_ICACHE_DRAIN_LIST];
+uint32_t gIcacheDirtyCount = 0;
+// Set when a fill arrives with the log already full. The log then no longer
+// names every dirty cell, so the drain must fall back to the slot-table walk.
+bool gIcacheDirtyOverflow = false;
 
 // The blob this core's seen-epoch was taken from. Part of the key because a
 // fresh blob restarts the epoch at 0, which a stale seen-epoch could match by
@@ -242,7 +265,11 @@ bool llvm::ejit::ejitIcacheRegisterSlot(uint32_t funcIndex, void *base,
 
   gIcacheSlots[funcIndex].base = reinterpret_cast<uintptr_t *>(base);
   gIcacheSlots[funcIndex].numDims = numDims;
-  gIcacheSlots[funcIndex].fills = 0;
+  // Any cells this slot had logged belong to the previous registration. They
+  // stay in the log; the drain re-validates each entry against the base and
+  // shape registered at drain time, so a stale one is dropped or lands
+  // harmlessly inside the new array.
+  gIcacheSlots[funcIndex].touched = 0;
   return true;
 }
 
@@ -256,8 +283,12 @@ void llvm::ejit::ejitIcacheClearAll() {
   for (uint32_t f = 0; f < EJIT_ICACHE_FUNC_SLOTS; ++f) {
     gIcacheSlots[f].base = nullptr;
     gIcacheSlots[f].numDims = 0;
-    gIcacheSlots[f].fills = 0;
+    gIcacheSlots[f].touched = 0;
   }
+  // The log names cells of the slots just unregistered: drop it, or the next
+  // drain would walk entries whose bases are gone.
+  gIcacheDirtyCount = 0;
+  gIcacheDirtyOverflow = false;
   gIcacheSeenEpoch = 0;
   if (gProbeEpoch)
     gProbeEpoch->seen = 0;
@@ -274,25 +305,41 @@ void llvm::ejit::ejitIcacheClearAll() {
 // running it (code is never freed under the gate this cache requires), so
 // zeroing only affects subsequent probes.
 static void icacheDrainCells() {
-  for (uint32_t f = 0; f < EJIT_ICACHE_FUNC_SLOTS; ++f) {
-    EJitIcacheSlotReg &reg = gIcacheSlots[f];
-    if (!reg.base)
-      continue;
-    if (!reg.fills)
-      continue; // never filled since the last drain: nothing to clear
-    if (reg.numDims > EJIT_ICACHE_MAX_DIMS)
-      continue; // defence in depth: never walk past a mis-sized array
-    const uintptr_t cells = icacheCellCount(reg.numDims);
-    if (reg.fills <= EJIT_ICACHE_DRAIN_LIST) {
-      for (uint32_t i = 0; i < reg.fills; ++i)
-        if (reg.filled[i] < cells)
-          reg.base[reg.filled[i]] = 0;
-    } else {
-      for (uintptr_t c = 0; c < cells; ++c) // more identities than we recorded
-        reg.base[c] = 0;
+  if (!gIcacheDirtyOverflow) {
+    // The log names every dirty cell: clear exactly those and touch nothing
+    // else. No walk over the slot table at all.
+    for (uint32_t i = 0; i < gIcacheDirtyCount; ++i) {
+      const EJitIcacheDirtyEnt &ent = gIcacheDirty[i];
+      EJitIcacheSlotReg &reg = gIcacheSlots[ent.funcIndex];
+      // The slot may have been unregistered, or re-registered against a
+      // different base/shape, since the fill was logged. Zeroing a cell is
+      // always safe (it can only cause a miss), but it must land inside the
+      // array that is registered NOW.
+      if (!reg.base || reg.numDims > EJIT_ICACHE_MAX_DIMS)
+        continue;
+      if (ent.cell < icacheCellCount(reg.numDims))
+        reg.base[ent.cell] = 0;
+      reg.touched = 0;
     }
-    reg.fills = 0;
+  } else {
+    // The log dropped at least one cell, so it no longer names everything that
+    // is dirty: fall back to whole-array clearing every touched slot.
+    for (uint32_t f = 0; f < EJIT_ICACHE_FUNC_SLOTS; ++f) {
+      EJitIcacheSlotReg &reg = gIcacheSlots[f];
+      if (!reg.base)
+        continue;
+      if (!reg.touched)
+        continue; // never filled since the last drain: nothing to clear
+      if (reg.numDims > EJIT_ICACHE_MAX_DIMS)
+        continue; // defence in depth: never walk past a mis-sized array
+      const uintptr_t cells = icacheCellCount(reg.numDims);
+      for (uintptr_t c = 0; c < cells; ++c)
+        reg.base[c] = 0;
+      reg.touched = 0;
+    }
   }
+  gIcacheDirtyCount = 0;
+  gIcacheDirtyOverflow = false;
 }
 
 bool EJitSharedTaskPool::icacheSyncEpoch() {
@@ -524,9 +571,14 @@ void EJitSharedTaskPool::icacheFill(uint32_t funcIndex, void *fnPtr,
   // No atomic/release: same-core, and the read's data dependency on the pointer
   // orders this store-before-use.
   uintptr_t idx = icacheLinearize(dims, numDims);
-  if (reg.fills < EJIT_ICACHE_DRAIN_LIST)
-    reg.filled[reg.fills] = static_cast<uint32_t>(idx);
-  ++reg.fills;
+  // Log the cell so the next drain can clear it without walking the table. A
+  // full log is not an error: it only costs the drain its precise path.
+  if (gIcacheDirtyCount < EJIT_ICACHE_DRAIN_LIST)
+    gIcacheDirty[gIcacheDirtyCount++] =
+        EJitIcacheDirtyEnt{funcIndex, static_cast<uint32_t>(idx)};
+  else
+    gIcacheDirtyOverflow = true;
+  reg.touched = 1;
   reg.base[idx] = reinterpret_cast<uintptr_t>(fnPtr);
   EJIT_DIAG("icacheFill OK func=%u dims=%u idx=%zu fn=%p cell[0]=%p",
             funcIndex, numDims, (size_t)idx, fnPtr, (void *)reg.base[0]);

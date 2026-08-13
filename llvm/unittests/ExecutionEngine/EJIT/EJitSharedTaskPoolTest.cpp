@@ -3575,35 +3575,80 @@ TEST_F(SharedTaskPoolTest, DrainClearsSparseCellsBeyondALeadingHole) {
   ejitIcacheClearAll();
 }
 
-// More distinct identities than the slot records: the drain falls back to the
-// whole array rather than clearing only the ones it remembered.
+// More filled cells than the global log holds: the drain falls back to walking
+// the slot table and whole-array clearing every touched slot, instead of
+// clearing only the cells it managed to record.
 TEST_F(SharedTaskPoolTest, DrainFallsBackWhenTheFilledListOverflows) {
   ejitIcacheClearAll();
   EJitSharedTaskPool pool;
   bringUpOwner(pool);
   constexpr uint32_t kFunc = 9;
-  // A 2D entry: 256 cells, so more distinct identities than the list holds.
+  constexpr uint32_t kD = EJIT_ICACHE_DIM_SIZE;
+  // A 3D entry: kD^3 cells, so this one slot alone can outrun the log.
   constexpr uint32_t kUsed = EJIT_ICACHE_DRAIN_LIST + 4u;
-  static_assert(kUsed <= EJIT_ICACHE_DIM_SIZE * EJIT_ICACHE_DIM_SIZE,
-                "need more cells than the list holds to exercise the fallback");
-  uintptr_t cells[EJIT_ICACHE_DIM_SIZE][EJIT_ICACHE_DIM_SIZE] = {};
-  ASSERT_TRUE(registerSlot(kFunc, &cells[0][0], 2));
+  static_assert(kUsed <= kD * kD * kD,
+                "need more cells than the log holds to exercise the fallback");
+  // Flat, in the row-major order icacheLinearize produces, so the identity
+  // (i/kD^2, (i/kD)%kD, i%kD) lands exactly on cells[i].
+  uintptr_t cells[kD * kD * kD] = {};
+  ASSERT_TRUE(registerSlot(kFunc, cells, 3));
   pool.icacheSyncEpoch();
 
   for (uint32_t i = 0; i < kUsed; ++i) {
-    const EJitDimPair d[2] = {{0, i / EJIT_ICACHE_DIM_SIZE},
-                              {1, i % EJIT_ICACHE_DIM_SIZE}};
-    pool.icacheFill(kFunc, codeFor(kFunc + i), d, 2);
+    const EJitDimPair d[3] = {
+        {0, i / (kD * kD)}, {1, (i / kD) % kD}, {2, i % kD}};
+    pool.icacheFill(kFunc, codeFor(kFunc + i), d, 3);
   }
   for (uint32_t i = 0; i < kUsed; ++i)
-    ASSERT_NE(cells[i / EJIT_ICACHE_DIM_SIZE][i % EJIT_ICACHE_DIM_SIZE], 0u)
-        << "identity " << i;
+    ASSERT_NE(cells[i], 0u) << "identity " << i;
 
   pool.setInstanceEnabled(0, 1, true);
   EXPECT_TRUE(pool.icacheSyncEpoch());
   for (uint32_t i = 0; i < kUsed; ++i)
-    EXPECT_EQ(cells[i / EJIT_ICACHE_DIM_SIZE][i % EJIT_ICACHE_DIM_SIZE], 0u)
+    EXPECT_EQ(cells[i], 0u)
         << "identity " << i << " survived the overflow drain";
+
+  ejitIcacheClearAll();
+}
+
+// The drain log is ONE table shared by every slot, so a drain has to resolve
+// each entry back to its own slot. Interleaving fills across slots would come
+// out right for free with a per-slot list; with a shared log it is the thing
+// that can break, and a cell drained against the wrong base is a silent stale
+// hit. Stays under the cap so this exercises the precise path, not the walk.
+TEST_F(SharedTaskPoolTest, DrainLogIsSharedAcrossSlots) {
+  ejitIcacheClearAll();
+  EJitSharedTaskPool pool;
+  bringUpOwner(pool);
+  constexpr uint32_t kSlots = 8;
+  constexpr uint32_t kD = EJIT_ICACHE_DIM_SIZE;
+  static_assert(kSlots * 2 <= EJIT_ICACHE_DRAIN_LIST,
+                "must stay under the cap to test the precise drain path");
+  uintptr_t cells[kSlots][kD] = {};
+  for (uint32_t s = 0; s < kSlots; ++s)
+    ASSERT_TRUE(registerSlot(s, cells[s], 1));
+  pool.icacheSyncEpoch();
+
+  // Two identities per slot, interleaved so no slot's entries are contiguous.
+  for (uint32_t id : {3u, 11u})
+    for (uint32_t s = 0; s < kSlots; ++s) {
+      const EJitDimPair d[1] = {{0, id}};
+      pool.icacheFill(s, codeFor(s * kD + id), d, 1);
+    }
+  for (uint32_t s = 0; s < kSlots; ++s) {
+    ASSERT_NE(cells[s][3], 0u) << "slot " << s;
+    ASSERT_NE(cells[s][11], 0u) << "slot " << s;
+    cells[s][7] = 0xDEADBEEF; // never filled: the precise drain must miss it
+  }
+
+  pool.setInstanceEnabled(0, 1, true);
+  EXPECT_TRUE(pool.icacheSyncEpoch());
+  for (uint32_t s = 0; s < kSlots; ++s) {
+    EXPECT_EQ(cells[s][3], 0u) << "slot " << s << " identity 3 survived";
+    EXPECT_EQ(cells[s][11], 0u) << "slot " << s << " identity 11 survived";
+    EXPECT_EQ(cells[s][7], 0xDEADBEEFu)
+        << "slot " << s << " lost a cell it never filled";
+  }
 
   ejitIcacheClearAll();
 }

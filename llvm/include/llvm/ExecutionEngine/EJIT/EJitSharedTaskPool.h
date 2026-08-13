@@ -128,12 +128,22 @@ enum class EJitWorkerStep : uint32_t {
 #ifndef EJIT_ICACHE_MAX_DIMS
 #define EJIT_ICACHE_MAX_DIMS 4u
 #endif
-// How many filled cell indices a slot remembers so a drain can clear exactly
-// those. Beyond this the drain falls back to walking the whole array, so the
-// cap only trades memory (4 bytes per entry per slot, core-private) for how
-// many distinct dim identities one core can touch between two drains.
+// Capacity of the ONE core-private log of (slot, cell) pairs filled since the
+// last drain, which lets the drain clear exactly those cells instead of walking
+// all EJIT_ICACHE_FUNC_SLOTS entries. Beyond this the drain falls back to that
+// walk, whole-array clearing every touched slot.
+//
+// The log is global, NOT per slot: a per-slot list is reserved for all
+// EJIT_ICACHE_FUNC_SLOTS (4096) entries however few a core calls, so 16 entries
+// would cost 64B x 4096 = 256KB of core-private BSS, while the same 16 entries
+// cost 128 bytes once here. That is what makes a generous cap affordable.
+//
+// Size it above the number of distinct (entry, dim identity) pairs one core
+// resolves between two period toggles -- roughly the count of ejit_entry
+// functions it calls, since the usual shape is one identity per core. 1024
+// covers the ~435-entry field image with headroom, for 8KB.
 #ifndef EJIT_ICACHE_DRAIN_LIST
-#define EJIT_ICACHE_DRAIN_LIST 16u
+#define EJIT_ICACHE_DRAIN_LIST 1024u
 #endif
 
 //===----------------------------------------------------------------------===//
