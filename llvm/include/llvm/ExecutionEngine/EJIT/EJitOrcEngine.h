@@ -11,6 +11,7 @@
 
 #include "llvm/ADT/StringRef.h"
 #include "llvm/ExecutionEngine/EJIT/EJitCodeRange.h"
+#include "llvm/ExecutionEngine/EJIT/EJitBoundPtr.h"
 #include "llvm/ExecutionEngine/EJIT/EJitOptions.h"
 #include "llvm/ExecutionEngine/EJIT/EJitProfileMerge.h"
 #ifdef EJIT_SRE_PGO_BRANCH_AUDIT
@@ -107,8 +108,9 @@ struct SpecializationContext {
     uint32_t dimType = 0xFFFFFFFFu;
   };
   SmallVector<DimInfo, 4> dimensions;
-  uint32_t boundArgIndex = 0;
-  SmallVector<uint8_t, 256> boundData;
+  /// Borrowed bound-pointer views. This vector is used only during the
+  /// compile callback and never owns or frees the pointed-to objects.
+  SmallVector<EJitBoundPointerView, kEJitMaxBoundPointers> boundPointers;
   OptimizationLevel optLevel = OptimizationLevel::L2;
   /// PGO tier (Baseline when PGO is disabled or for the first compile).
   CompileTier tier = CompileTier::Baseline;

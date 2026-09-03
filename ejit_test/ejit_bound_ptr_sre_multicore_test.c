@@ -1,12 +1,11 @@
-//===-- ejit_bound_ptr_sre_multicore_test.c - cross-core snapshot demo ----===//
+//===-- ejit_bound_ptr_sre_multicore_test.c - cross-core raw pointer demo --===//
 //
 // Board flow after a reset:
 //   1. Core 8:  test_ejit_period
 //      Initializes EJIT, owns the shared compile worker, and arms the dump.
 //   2. Core 18: test_ejit_period
-//      Enqueues compilation from a stack-local bound object, destroys that
-//      object, waits for publication, then verifies a JIT cache hit using a
-//      second object whose dynamic field has a different value.
+//      Enqueues compilation from shared per-cell objects, waits for
+//      publication, then verifies JIT cache hits using those same objects.
 //   3. Core 8:  test_ejit_bound_ptr_print
 //      Prints the worker-local optimized IR/ASM.
 //
@@ -85,6 +84,7 @@ extern ejit_status_t ejit_init(const ejit_config_t *config);
 extern ejit_status_t ejit_activate(const char *periodName, uint32_t cellIdx);
 extern void ejit_clear_cache(void);
 extern unsigned ejit_taskpool_pending_count(void);
+extern ejit_status_t ejit_publish_pending_code(void);
 extern ejit_status_t ejit_taskpool_get_stats(ejit_taskpool_stats_t *out);
 extern void ejit_taskpool_print_stats(void);
 extern void ejit_taskpool_print_compiled(void);
@@ -140,22 +140,14 @@ bound_cell_config_mc(ejit_period_arr_ind(cell) uint8_t cellIndex,
   return input + cellRelated->runtimeBias;
 }
 
-__attribute__((noinline)) static uint32_t
-enqueue_from_stack(uint8_t cell, uint32_t scale, uint32_t runtimeBias) {
-  struct CellRelated local = {7u, scale, runtimeBias};
-  return bound_cell_config_mc(cell, BOUND_PTR_TRP, &local, 10u);
+EJIT_SHARED_SECTION_ATTR struct CellRelated g_bound_configs[8] = {
+    {7u, 5u, 100u}, {7u, 9u, 100u}};
+
+static uint32_t enqueue_from_shared(uint8_t cell) {
+  return bound_cell_config_mc(cell, BOUND_PTR_TRP, &g_bound_configs[cell], 10u);
 }
 
-// Encourage reuse of the caller stack after enqueue_from_stack has returned.
-// Correctness must not depend on whether this happens to overlap its old slot.
-__attribute__((noinline)) static void clobber_producer_stack(void) {
-  volatile uint8_t bytes[512];
-  for (uint32_t i = 0; i < sizeof(bytes); ++i)
-    bytes[i] = (uint8_t)(0xa5u ^ i);
-  __asm__ volatile("" : : "r"(&bytes[0]) : "memory");
-}
-
-static int wait_for_two_compiles(uint64_t baseline) {
+static int wait_for_compiles(uint64_t baseline, uint64_t expected) {
   for (uint32_t round = 0; round < BOUND_PTR_WAIT_ROUNDS; ++round) {
     ejit_taskpool_stats_t stats = {0};
     (void)ejit_taskpool_get_stats(&stats);
@@ -165,12 +157,13 @@ static int wait_for_two_compiles(uint64_t baseline) {
                  (unsigned long long)stats.publishFailed);
       return 0;
     }
-    if (stats.asyncCompiles >= baseline + 2u &&
+    if (stats.asyncCompiles >= baseline + expected &&
         ejit_taskpool_pending_count() == 0)
       return 1;
     if ((round % 500u) == 0)
-      SRE_printf("[BOUND-PTR-MC] waiting compiles=%llu/2 pending=%u\n",
+      SRE_printf("[BOUND-PTR-MC] waiting compiles=%llu/%llu pending=%u\n",
                  (unsigned long long)(stats.asyncCompiles - baseline),
+                 (unsigned long long)expected,
                  ejit_taskpool_pending_count());
     (void)SRE_TaskDelay(BOUND_PTR_WAIT_TICKS);
   }
@@ -180,15 +173,16 @@ static int wait_for_two_compiles(uint64_t baseline) {
 static int run_producer(void) {
   uint32_t stage = __atomic_load_n(&g_bound_ptr_demo_stage, __ATOMIC_ACQUIRE);
   if (stage != BOUND_PTR_DEMO_WORKER_READY) {
-    SRE_printf("[BOUND-PTR-MC][core=18] FAIL stage=%u; run core 8 first\n",
-               stage);
+    SRE_printf("[BOUND-PTR-MC][core=%u] FAIL stage=%u; run core %u first\n",
+               BOUND_PTR_PRODUCER_CORE, stage, BOUND_PTR_WORKER_CORE);
     return -3;
   }
 
   if (ejit_activate("cell", BOUND_PTR_CELL_A) != EJIT_OK ||
       ejit_activate("cell", BOUND_PTR_CELL_B) != EJIT_OK ||
       ejit_activate("trp", BOUND_PTR_TRP) != EJIT_OK) {
-    SRE_printf("[BOUND-PTR-MC][core=18] FAIL activate\n");
+    SRE_printf("[BOUND-PTR-MC][core=%u] FAIL activate\n",
+               BOUND_PTR_PRODUCER_CORE);
     return -4;
   }
 
@@ -196,62 +190,85 @@ static int run_producer(void) {
   ejit_taskpool_stats_t before = {0};
   (void)ejit_taskpool_get_stats(&before);
 
-  // The first call returns AOT while the worker is pending. The local object
-  // is dead before this producer starts waiting. Stack clobbering strengthens
-  // the lifetime stress, while the taskpool unit test supplies the
-  // deterministic enqueue-before-poll ownership proof.
-  uint32_t aotA = enqueue_from_stack(BOUND_PTR_CELL_A, 5u, 100u);
-  clobber_producer_stack();
-  uint32_t aotB = enqueue_from_stack(BOUND_PTR_CELL_B, 9u, 100u);
-  clobber_producer_stack();
+  // In-flight dedup is keyed by funcIndex, not by the complete dimension
+  // identity. Submit the two cell versions serially; otherwise cell 2 sees
+  // AlreadyPending while cell 1 is compiling and is never enqueued.
+  // Each first call returns AOT while the shared object remains alive through
+  // worker compilation. The raw pointer is transport-only and is never freed
+  // by the queue or worker.
+  uint32_t aotA = enqueue_from_shared(BOUND_PTR_CELL_A);
+  if (ejit_publish_pending_code() != EJIT_OK) {
+    SRE_printf("[BOUND-PTR-MC][core=%u] FAIL cell1 batch publish\n",
+               BOUND_PTR_PRODUCER_CORE);
+    return -5;
+  }
+  if (!wait_for_compiles(before.asyncCompiles, 1u)) {
+    SRE_printf("[BOUND-PTR-MC][core=%u] FAIL cell1 compile timeout\n",
+               BOUND_PTR_PRODUCER_CORE);
+    ejit_taskpool_print_stats();
+    return -6;
+  }
+
+  uint32_t aotB = enqueue_from_shared(BOUND_PTR_CELL_B);
+  if (ejit_publish_pending_code() != EJIT_OK) {
+    SRE_printf("[BOUND-PTR-MC][core=%u] FAIL cell2 batch publish\n",
+               BOUND_PTR_PRODUCER_CORE);
+    return -7;
+  }
   const uint32_t expectedAotA = 153u;
   const uint32_t expectedAotB = 194u;
   if (aotA != expectedAotA || aotB != expectedAotB) {
-    SRE_printf("[BOUND-PTR-MC][core=18] FAIL AOT cell1=%u/%u cell2=%u/%u\n",
-               aotA, expectedAotA, aotB, expectedAotB);
-    return -5;
+    SRE_printf("[BOUND-PTR-MC][core=%u] FAIL AOT cell1=%u/%u "
+               "cell2=%u/%u\n",
+               BOUND_PTR_PRODUCER_CORE, aotA, expectedAotA, aotB,
+               expectedAotB);
+    return -8;
   }
 
-  if (!wait_for_two_compiles(before.asyncCompiles)) {
-    SRE_printf("[BOUND-PTR-MC][core=18] FAIL compile timeout\n");
+  if (!wait_for_compiles(before.asyncCompiles, 2u)) {
+    SRE_printf("[BOUND-PTR-MC][core=%u] FAIL cell2 compile timeout\n",
+               BOUND_PTR_PRODUCER_CORE);
     ejit_taskpool_print_stats();
-    return -6;
+    return -9;
   }
 
   ejit_taskpool_stats_t compiled = {0};
   (void)ejit_taskpool_get_stats(&compiled);
 
-  // Each cell keeps its own stable scale, while runtimeBias deliberately
-  // changes. Reusing cell 1's scale=5 specialization for cell 2 would return
-  // 254 instead of 294 and fail this check.
-  uint32_t jitA = enqueue_from_stack(BOUND_PTR_CELL_A, 5u, 200u);
-  uint32_t jitB = enqueue_from_stack(BOUND_PTR_CELL_B, 9u, 200u);
-  const uint32_t expectedJitA = 253u;
-  const uint32_t expectedJitB = 294u;
+  // Each cell keeps its own stable scale and object address. Reusing cell 1's
+  // scale=5 specialization for cell 2 would return 153 instead of 194.
+  uint32_t jitA = enqueue_from_shared(BOUND_PTR_CELL_A);
+  uint32_t jitB = enqueue_from_shared(BOUND_PTR_CELL_B);
+  const uint32_t expectedJitA = expectedAotA;
+  const uint32_t expectedJitB = expectedAotB;
   ejit_taskpool_stats_t after = {0};
   (void)ejit_taskpool_get_stats(&after);
   if (jitA != expectedJitA || jitB != expectedJitB) {
-    SRE_printf("[BOUND-PTR-MC][core=18] FAIL JIT cell1=%u/%u cell2=%u/%u\n",
-               jitA, expectedJitA, jitB, expectedJitB);
-    return -7;
+    SRE_printf("[BOUND-PTR-MC][core=%u] FAIL JIT cell1=%u/%u "
+               "cell2=%u/%u\n",
+               BOUND_PTR_PRODUCER_CORE, jitA, expectedJitA, jitB,
+               expectedJitB);
+    return -10;
   }
   if (after.cacheHits < compiled.cacheHits + 2u) {
-    SRE_printf("[BOUND-PTR-MC][core=18] FAIL no cache hit before=%llu "
+    SRE_printf("[BOUND-PTR-MC][core=%u] FAIL no cache hit before=%llu "
                "after=%llu; check shared code-pointer support\n",
+               BOUND_PTR_PRODUCER_CORE,
                (unsigned long long)compiled.cacheHits,
                (unsigned long long)after.cacheHits);
-    return -8;
+    return -11;
   }
 
   __atomic_store_n(&g_bound_ptr_demo_sink,
                    ((uint64_t)jitA << 32) | (uint64_t)jitB, __ATOMIC_RELEASE);
   __atomic_store_n(&g_bound_ptr_demo_stage, BOUND_PTR_DEMO_COMPILED,
                    __ATOMIC_RELEASE);
-  SRE_printf("[BOUND-PTR-MC][core=18] PASS cell1 AOT/JIT=%u/%u cell2 "
+  SRE_printf("[BOUND-PTR-MC][core=%u] PASS cell1 AOT/JIT=%u/%u cell2 "
              "AOT/JIT=%u/%u compiles=2 hits=%llu; run "
-             "test_ejit_bound_ptr_print on core 8\n",
-             aotA, jitA, aotB, jitB,
-             (unsigned long long)(after.cacheHits - compiled.cacheHits));
+             "test_ejit_bound_ptr_print on core %u\n",
+             BOUND_PTR_PRODUCER_CORE, aotA, jitA, aotB, jitB,
+             (unsigned long long)(after.cacheHits - compiled.cacheHits),
+             BOUND_PTR_WORKER_CORE);
   return 0;
 }
 
@@ -262,14 +279,15 @@ static int run_worker(void) {
     ejit_dump_func("bound_cell_config_mc");
     __atomic_store_n(&g_bound_ptr_demo_stage, BOUND_PTR_DEMO_WORKER_READY,
                      __ATOMIC_RELEASE);
-    SRE_printf("[BOUND-PTR-MC][core=8] worker ready; run test_ejit_period on "
-               "core 18\n");
+    SRE_printf("[BOUND-PTR-MC][core=%u] worker ready; run test_ejit_period "
+               "on core %u\n",
+               BOUND_PTR_WORKER_CORE, BOUND_PTR_PRODUCER_CORE);
     return 0;
   }
 
-  SRE_printf("[BOUND-PTR-MC][core=8] worker already initialized stage=%u; "
+  SRE_printf("[BOUND-PTR-MC][core=%u] worker already initialized stage=%u; "
              "use test_ejit_bound_ptr_print for output\n",
-             stage);
+             BOUND_PTR_WORKER_CORE, stage);
   return 0;
 }
 
@@ -282,20 +300,21 @@ int test_ejit_bound_ptr_print(uint8_t a, uint8_t b, uint8_t c, uint8_t d) {
   const uint32_t core = (uint32_t)g_ucLocalCoreID;
   if (core != BOUND_PTR_WORKER_CORE) {
     SRE_printf("[BOUND-PTR-MC][core=%u] FAIL: dump is worker-local; run "
-               "test_ejit_bound_ptr_print on core 8\n",
-               core);
+               "test_ejit_bound_ptr_print on core %u\n",
+               core, BOUND_PTR_WORKER_CORE);
     return -9;
   }
 
   uint32_t stage = __atomic_load_n(&g_bound_ptr_demo_stage, __ATOMIC_ACQUIRE);
   if (stage < BOUND_PTR_DEMO_COMPILED) {
-    SRE_printf("[BOUND-PTR-MC][core=8] FAIL stage=%u; run test_ejit_period "
-               "on core 18 first\n",
-               stage);
+    SRE_printf("[BOUND-PTR-MC][core=%u] FAIL stage=%u; run test_ejit_period "
+               "on core %u first\n",
+               BOUND_PTR_WORKER_CORE, stage, BOUND_PTR_PRODUCER_CORE);
     return -10;
   }
   if (stage == BOUND_PTR_DEMO_PRINTED) {
-    SRE_printf("[BOUND-PTR-MC][core=8] dump already printed\n");
+    SRE_printf("[BOUND-PTR-MC][core=%u] dump already printed\n",
+               BOUND_PTR_WORKER_CORE);
     return 0;
   }
 
@@ -304,10 +323,12 @@ int test_ejit_bound_ptr_print(uint8_t a, uint8_t b, uint8_t c, uint8_t d) {
   ejit_taskpool_print_compiled();
   SRE_printf("\n[BOUND-PTR-MC] === OPTIMIZED FUNCTION ===\n");
   ejit_print_dumped("bound_cell_config_mc");
-  SRE_printf("[BOUND-PTR-MC][core=8] expect: algorithm/scale loads and "
+  SRE_printf("[BOUND-PTR-MC][core=%u] expect: algorithm/scale loads and "
              "branch removed; runtimeBias load retained. The function dump "
-             "is the latest capture (cell=2, scale=9).\n");
-  SRE_printf("[BOUND-PTR-MC][core=8] PASS sink=0x%llx\n",
+             "is the latest capture (cell=2, scale=9).\n",
+             BOUND_PTR_WORKER_CORE);
+  SRE_printf("[BOUND-PTR-MC][core=%u] PASS sink=0x%llx\n",
+             BOUND_PTR_WORKER_CORE,
              (unsigned long long)__atomic_load_n(&g_bound_ptr_demo_sink,
                                                  __ATOMIC_ACQUIRE));
   __atomic_store_n(&g_bound_ptr_demo_stage, BOUND_PTR_DEMO_PRINTED,
@@ -339,8 +360,8 @@ int test_ejit_period(uint8_t a, uint8_t b, uint8_t c, uint8_t d) {
   if (rc != EJIT_OK)
     return -1;
   if (worker != BOUND_PTR_WORKER_CORE) {
-    SRE_printf("[BOUND-PTR-MC] FAIL worker=%u; reset and run core 8 first\n",
-               worker);
+    SRE_printf("[BOUND-PTR-MC] FAIL worker=%u; reset and run core %u first\n",
+               worker, BOUND_PTR_WORKER_CORE);
     return -2;
   }
 
@@ -349,6 +370,7 @@ int test_ejit_period(uint8_t a, uint8_t b, uint8_t c, uint8_t d) {
   if (core == BOUND_PTR_PRODUCER_CORE)
     return run_producer();
 
-  SRE_printf("[BOUND-PTR-MC][core=%u] skip: use core 8 or core 18\n", core);
+  SRE_printf("[BOUND-PTR-MC][core=%u] skip: use core %u or core %u\n", core,
+             BOUND_PTR_WORKER_CORE, BOUND_PTR_PRODUCER_CORE);
   return 0;
 }

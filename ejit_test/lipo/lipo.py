@@ -23,11 +23,12 @@ Override with --cxx / --ld for cross-compilation.
 The resulting ejit.o (~30-40 MB) can replace all individual LLVM .a files
 when linking EJIT test binaries.
 
-When the EJIT ASM diagnostic dump (ejit_dump_func / ejit_print_dumped) is
-enabled on SRE (EJIT_DUMP_ASM=ON under EJIT_TRIM_LLVM_BACKEND), the assembly
-emitter formats text into an in-memory raw_svector_ostream and therefore
-needs working buffer formatting (snprintf/vsnprintf). Link a libc that
-provides them; OR, if the SRE libc lacks them, add
+When the EJIT ASM diagnostic dump (ejit_dump_func / ejit_print_dumped /
+ejit_print_dumped_module) is enabled on SRE (EJIT_DUMP_ASM=ON under
+EJIT_TRIM_LLVM_BACKEND), the assembly emitter formats text into an in-memory
+raw_svector_ostream and therefore needs working buffer formatting
+(snprintf/vsnprintf). Link a libc that provides them; OR, if the SRE libc lacks
+them, add
 ejit_test/stubs/ejit_sre_format_stubs.o to the final SRE link/merge command
 alongside ejit.o — not both (strong-symbol conflict on snprintf/vsnprintf).
 The stub is intentionally NOT merged into ejit.o here so host builds keep
@@ -382,7 +383,9 @@ def doit_gc_merge(args):
         "ejit_verify_reset_stats", "ejit_verify_available",
         "ejit_verify_get_sites",
         "ejit_register_lifecycle", "ejit_register_funcindex",
-        "ejit_taskpool_compile_or_get", "ejit_taskpool_release_read",
+        "ejit_taskpool_compile_or_get", "ejit_taskpool_compile_or_get_bound",
+        "ejit_taskpool_compile_or_get_bound_v",
+        "ejit_taskpool_release_read",
         "ejit_taskpool_compile_or_get_0d", "ejit_taskpool_compile_or_get_1d",
         "ejit_taskpool_compile_or_get_2d", "ejit_taskpool_compile_or_get_3d",
         "ejit_taskpool_compile_or_get_4d",
@@ -391,7 +394,8 @@ def doit_gc_merge(args):
         "ejit_taskpool_get_stats", "ejit_taskpool_print_stats", "ejit_taskpool_get_worker_core",
         "ejit_taskpool_print_compiled", "ejit_taskpool_trace_now",
         "ejit_taskpool_trace_wrapper", "ejit_dump_func", "ejit_print_dumped",
-        "ejit_dump_all", "ejit_print_mayconst_ranking",
+        "ejit_print_dumped_module", "ejit_dump_all",
+        "ejit_print_mayconst_ranking",
         # Inline-cache: ejit_register_icache_slot is called from
         # ejit_auto_register (AOT) when -ejit-inline-cache is on, not from the
         # runtime, so gc-merge's --gc-sections would discard it without this GC

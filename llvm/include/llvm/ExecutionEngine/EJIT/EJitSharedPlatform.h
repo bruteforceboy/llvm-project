@@ -98,7 +98,7 @@ constexpr uint32_t kEJitSharedAbiMagic = 0x456A5370u; // "EjSp"
 /// the shared blob also records completed-function and deferred-miss counts.
 /// v13: non-owner cores can post a may_const-ranking diagnostic request to the
 /// owner worker and wait for its completion without sharing optimizer objects.
-/// v14: EJitCompileRequest owns an inline bound-pointer snapshot.
+/// v14: EJitCompileRequest introduced the old inline bound-pointer payload.
 /// v15: each cache slot records whether its published JIT pointer was resolved
 /// by a later taskpool lookup, diagnosing compiled versions with no reuse.
 /// v16: code ranges identify near/far placement and the shared code-pool
@@ -113,7 +113,10 @@ constexpr uint32_t kEJitSharedAbiMagic = 0x456A5370u; // "EjSp"
 /// recorded (print_compiled reports fn_size=0, overhead=codeSize).
 /// v19: the owner-published pool mirror carries the 16 cell + public near-hot
 /// pool details and pool ids are stable across separate managers.
-constexpr uint32_t kEJitSharedAbiVersion = 19u;
+/// v20: the old inline payload is replaced by a fixed table of borrowed
+/// raw bound-pointer descriptors; no pointee bytes or ownership cross the
+/// shared queue.
+constexpr uint32_t kEJitSharedAbiVersion = 20u;
 
 /// Sentinel "no core" id. Out of any plausible core-id range.
 constexpr uint32_t kEJitInvalidCoreId = 0xFFFFFFFFu;

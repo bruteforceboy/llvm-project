@@ -20,8 +20,10 @@
 #include "llvm/Transforms/Utils/Local.h"
 #include "llvm/Support/Casting.h"
 #include "llvm/Support/Debug.h"
+#include <algorithm>
 #include <cassert>
 #include <cstring>
+#include <limits>
 
 using namespace llvm;
 using namespace llvm::ejit;
@@ -92,6 +94,7 @@ void EJitStructFieldPass::initFromModule(Module &M) {
       mayConstFieldMap_[&GV] = std::move(offsets);
   }
 
+  initBoundArgumentPropagation(M);
   mapsBuilt_ = true;
 #ifdef EJIT_DIAG_ENABLE
   EJIT_DIAG_DEBUG("struct-field initFromModule module=%s globals=%zu "
@@ -141,55 +144,72 @@ static bool functionBindsArgument(const Function &F, unsigned ArgIndex) {
   return false;
 }
 
-static std::optional<uint64_t> accumulateArgumentOffset(const DataLayout &DL,
-                                                        const Value *PtrOp,
-                                                        const Argument *Root);
-
-static bool isBoundMayConstLoad(LoadInst *LI, const Function &F,
-                                unsigned ArgIndex, const DataLayout &DL) {
-  if (LI->isVolatile() || LI->isAtomic() || ArgIndex >= F.arg_size())
-    return false;
-  const Argument *Root = findRootArgument(LI->getPointerOperand());
-  if (!Root || Root->getArgNo() != ArgIndex)
-    return false;
-  if (LI->hasMetadata(MD_EJIT_MAY_CONST))
-    return true;
-
-  auto Offset = accumulateArgumentOffset(DL, LI->getPointerOperand(), Root);
-  TypeSize AccessSize = DL.getTypeStoreSize(LI->getType());
-  if (!Offset || AccessSize.isScalable())
-    return false;
-
+static MDNode *getBoundArgumentMetadata(const Function &F,
+                                        unsigned ArgIndex) {
   MDNode *MD = F.getMetadata(MD_EJIT_METADATA);
   if (!MD)
-    return false;
+    return nullptr;
   for (const MDOperand &Op : MD->operands()) {
     auto *Sub = dyn_cast<MDNode>(Op.get());
     if (!Sub || Sub->getNumOperands() < 4)
       continue;
     auto *Tag = dyn_cast<MDString>(Sub->getOperand(0));
     auto *Idx = mdconst::dyn_extract<ConstantInt>(Sub->getOperand(2));
-    if (!Tag || Tag->getString() != TAG_EJIT_BOUND_PTR || !Idx ||
-        Idx->getZExtValue() != ArgIndex)
-      continue;
-    for (unsigned I = 4; I < Sub->getNumOperands(); ++I) {
-      auto *Field = dyn_cast<MDNode>(Sub->getOperand(I));
-      if (!Field || Field->getNumOperands() != 2)
-        continue;
-      auto *FieldOffset =
-          mdconst::dyn_extract<ConstantInt>(Field->getOperand(0));
-      auto *FieldSize = mdconst::dyn_extract<ConstantInt>(Field->getOperand(1));
-      if (FieldOffset && FieldSize) {
-        uint64_t Begin = FieldOffset->getZExtValue();
-        uint64_t Size = FieldSize->getZExtValue();
-        if (*Offset >= Begin && *Offset - Begin <= Size &&
-            AccessSize.getFixedValue() <= Size - (*Offset - Begin))
-          return true;
-      }
-    }
+    if (Tag && Tag->getString() == TAG_EJIT_BOUND_PTR && Idx &&
+        Idx->getZExtValue() == ArgIndex)
+      return Sub;
   }
-  return false;
+  return nullptr;
 }
+
+static bool hasMatchingBoundArgumentContract(
+    const Function &F, unsigned ArgIndex, StringRef PeriodName,
+    uint64_t BaseOffset, uint64_t RootSize,
+    ArrayRef<std::pair<uint64_t, uint64_t>> RootFields) {
+  MDNode *MD = getBoundArgumentMetadata(F, ArgIndex);
+  if (!MD)
+    return false;
+
+  auto *Period = dyn_cast<MDString>(MD->getOperand(1));
+  auto *Size = mdconst::dyn_extract<ConstantInt>(MD->getOperand(3));
+  if (!Period || Period->getString() != PeriodName || !Size)
+    return false;
+  const uint64_t BoundSize = Size->getZExtValue();
+  if (!BoundSize || BaseOffset > RootSize || BoundSize > RootSize - BaseOffset)
+    return false;
+
+  SmallVector<std::pair<uint64_t, uint64_t>, 4> DeclaredFields;
+  for (unsigned I = 4; I < MD->getNumOperands(); ++I) {
+    auto *Field = dyn_cast<MDNode>(MD->getOperand(I));
+    if (!Field || Field->getNumOperands() != 2)
+      return false;
+    auto *Offset = mdconst::dyn_extract<ConstantInt>(Field->getOperand(0));
+    auto *FieldSize = mdconst::dyn_extract<ConstantInt>(Field->getOperand(1));
+    if (!Offset || !FieldSize || !FieldSize->getZExtValue() ||
+        Offset->getZExtValue() > BoundSize ||
+        FieldSize->getZExtValue() > BoundSize - Offset->getZExtValue())
+      return false;
+    DeclaredFields.emplace_back(Offset->getZExtValue(),
+                                FieldSize->getZExtValue());
+  }
+
+  SmallVector<std::pair<uint64_t, uint64_t>, 4> ExpectedFields;
+  for (const auto &[Offset, FieldSize] : RootFields) {
+    if (Offset < BaseOffset)
+      continue;
+    const uint64_t Relative = Offset - BaseOffset;
+    if (Relative > BoundSize || FieldSize > BoundSize - Relative)
+      continue;
+    ExpectedFields.emplace_back(Relative, FieldSize);
+  }
+  llvm::sort(DeclaredFields);
+  llvm::sort(ExpectedFields);
+  return DeclaredFields == ExpectedFields;
+}
+
+static std::optional<uint64_t> accumulateArgumentOffset(const DataLayout &DL,
+                                                        const Value *PtrOp,
+                                                        const Argument *Root);
 
 /// If all GEP indices are ConstantInt, compute the cumulative byte offset.
 /// Returns std::nullopt if any index is not constant.
@@ -249,6 +269,310 @@ static std::optional<uint64_t> accumulateArgumentOffset(const DataLayout &DL,
     PtrOp = GEP->getPointerOperand();
   }
   return std::nullopt;
+}
+
+static std::optional<uint64_t> getBoundPointerOffset(
+    const Value *V, const DenseMap<const Argument *, uint64_t> &BoundArguments,
+    const DataLayout &DL) {
+  const Argument *Root = findRootArgument(V);
+  if (!Root)
+    return std::nullopt;
+  auto It = BoundArguments.find(Root);
+  if (It == BoundArguments.end())
+    return std::nullopt;
+  auto Relative = accumulateArgumentOffset(DL, V, Root);
+  if (!Relative ||
+      It->second > std::numeric_limits<uint64_t>::max() - *Relative)
+    return std::nullopt;
+  return It->second + *Relative;
+}
+
+static Function *getDirectCallee(CallBase &CB) {
+  return dyn_cast<Function>(CB.getCalledOperand()->stripPointerCasts());
+}
+
+/// A bound pointer may cross a call edge only when the callee is itself an
+/// EJIT entry with the same dimension in its cache identity. Without this
+/// contract, a private helper could be specialized in the caller's module
+/// even though it has no independently addressable cell version.
+static std::optional<unsigned>
+getMatchingBoundEntryDimensionArg(const Function &F,
+                                  StringRef BoundPeriodName) {
+  if (!hasMDStringEntry(F.getMetadata(MD_EJIT_METADATA), TAG_EJIT_ENTRY))
+    return std::nullopt;
+
+  MDNode *MD = F.getMetadata(MD_EJIT_METADATA);
+  std::optional<unsigned> MatchingArg;
+  for (const MDOperand &Op : MD->operands()) {
+    auto *Sub = dyn_cast<MDNode>(Op.get());
+    if (!Sub || Sub->getNumOperands() < 3)
+      continue;
+    auto *Tag = dyn_cast<MDString>(Sub->getOperand(0));
+    auto *Period = dyn_cast<MDString>(Sub->getOperand(1));
+    auto *Idx = mdconst::dyn_extract<ConstantInt>(Sub->getOperand(2));
+    if (!Tag || Tag->getString() != TAG_EJIT_PERIOD_ARR_IND || !Period ||
+        Period->getString() != BoundPeriodName)
+      continue;
+    uint64_t ArgIndex = Idx ? Idx->getZExtValue() : 0;
+    if (!Idx || ArgIndex >= F.arg_size() ||
+        !F.getArg(static_cast<unsigned>(ArgIndex))->getType()->isIntegerTy())
+      return std::nullopt;
+    if (MatchingArg)
+      return std::nullopt;
+    MatchingArg = static_cast<unsigned>(ArgIndex);
+  }
+  return MatchingArg;
+}
+
+/// Strip integer casts from a dimension value. preReplacePeriodIndices leaves
+/// the Argument object in place, but replaces all of its uses with a constant;
+/// before that pass, direct calls commonly carry the caller's formal through a
+/// zext/trunc. Both forms are accepted below.
+static const Value *stripDimensionCasts(const Value *V) {
+  while (V) {
+    const Value *Stripped = V->stripPointerCasts();
+    if (Stripped != V) {
+      V = Stripped;
+      continue;
+    }
+
+    auto *Op = dyn_cast<Operator>(V);
+    if (!Op || Op->getNumOperands() != 1 || !Op->getType()->isIntegerTy() ||
+        !Op->getOperand(0)->getType()->isIntegerTy())
+      break;
+    switch (Op->getOpcode()) {
+    case Instruction::Trunc:
+    case Instruction::ZExt:
+    case Instruction::SExt:
+    case Instruction::BitCast:
+      V = Op->getOperand(0);
+      continue;
+    default:
+      break;
+    }
+    break;
+  }
+  return V;
+}
+
+static bool isSpecializedDimensionConstant(const Value *V, uint8_t Expected) {
+  V = stripDimensionCasts(V);
+  auto *CI = dyn_cast_or_null<ConstantInt>(V);
+  if (!CI || CI->getValue().getActiveBits() > 8)
+    return false;
+  return CI->getZExtValue() == Expected;
+}
+
+static bool
+callUsesSameBoundDimension(const CallBase &CB, StringRef BoundPeriodName,
+                           unsigned CalleeDimensionArg,
+                           std::optional<uint8_t> ExpectedInstance) {
+  const Function *Caller = CB.getFunction();
+  auto CallerDimension =
+      getMatchingBoundEntryDimensionArg(*Caller, BoundPeriodName);
+  if (!CallerDimension || CalleeDimensionArg >= CB.arg_size())
+    return false;
+
+  const Value *Actual = CB.getArgOperand(CalleeDimensionArg);
+  const Argument *CallerArg = Caller->getArg(*CallerDimension);
+  if (stripDimensionCasts(Actual) == CallerArg)
+    return true;
+  return ExpectedInstance &&
+         isSpecializedDimensionConstant(Actual, *ExpectedInstance);
+}
+
+void EJitStructFieldPass::initBoundArgumentPropagation(Module &M) {
+  boundStates_.clear();
+  if (boundPointers_.empty())
+    return;
+
+  const DataLayout &DL = M.getDataLayout();
+  SmallVector<CallBase *, 32> DirectCalls;
+  DenseMap<const Function *, SmallVector<CallBase *, 4>> CallsByCallee;
+  for (Function &Caller : M) {
+    if (Caller.isDeclaration())
+      continue;
+    for (BasicBlock &BB : Caller)
+      for (Instruction &I : BB) {
+        auto *CB = dyn_cast<CallBase>(&I);
+        if (!CB)
+          continue;
+        Function *Callee = getDirectCallee(*CB);
+        if (!Callee || Callee->isDeclaration())
+          continue;
+        DirectCalls.push_back(CB);
+        CallsByCallee[Callee].push_back(CB);
+      }
+  }
+
+  for (const EJitBoundPointerView &View : boundPointers_) {
+    if (!View.rawPtr || !View.size)
+      continue;
+
+    Function *Root = nullptr;
+    if (!boundRootFunction_.empty()) {
+      Root = M.getFunction(boundRootFunction_);
+    } else {
+      // Infer a root only when this argument index identifies one function.
+      // With multiple bound pointers the same function is intentionally found
+      // once per distinct metadata argument.
+      for (Function &F : M) {
+        if (!functionBindsArgument(F, View.argIndex))
+          continue;
+        if (Root) {
+          Root = nullptr;
+          break;
+        }
+        Root = &F;
+      }
+    }
+    if (!Root || Root->isDeclaration() || View.argIndex >= Root->arg_size() ||
+        !functionBindsArgument(*Root, View.argIndex))
+      continue;
+
+    Argument *RootArgument = Root->getArg(View.argIndex);
+    if (!RootArgument->getType()->isPointerTy())
+      continue;
+
+    BoundPointerState State;
+    State.view = View;
+    State.boundArguments[RootArgument] = 0;
+    StringRef BoundPeriodName;
+    if (MDNode *BoundMD = getBoundArgumentMetadata(*Root, View.argIndex)) {
+      if (auto *Period = dyn_cast<MDString>(BoundMD->getOperand(1)))
+        BoundPeriodName = Period->getString();
+      for (unsigned I = 4; I < BoundMD->getNumOperands(); ++I) {
+        auto *Field = dyn_cast<MDNode>(BoundMD->getOperand(I));
+        if (!Field || Field->getNumOperands() != 2)
+          continue;
+        auto *Offset = mdconst::dyn_extract<ConstantInt>(Field->getOperand(0));
+        auto *Size = mdconst::dyn_extract<ConstantInt>(Field->getOperand(1));
+        if (Offset && Size)
+          State.mayConstFields.push_back(
+              {Offset->getZExtValue(), Size->getZExtValue()});
+      }
+    }
+
+    if (!BoundPeriodName.empty()) {
+      bool Changed;
+      do {
+        Changed = false;
+        for (CallBase *CB : DirectCalls) {
+          Function *Callee = getDirectCallee(*CB);
+          auto CalleeDimension =
+              getMatchingBoundEntryDimensionArg(*Callee, BoundPeriodName);
+          if (!CalleeDimension)
+            continue;
+          if (!callUsesSameBoundDimension(
+                  *CB, BoundPeriodName, *CalleeDimension,
+                  View.periodInstance == std::numeric_limits<uint32_t>::max()
+                      ? std::nullopt
+                      : std::optional<uint8_t>(
+                            static_cast<uint8_t>(View.periodInstance))))
+            continue;
+          unsigned Count =
+              std::min<unsigned>(CB->arg_size(), Callee->arg_size());
+          for (unsigned ArgIndex = 0; ArgIndex < Count; ++ArgIndex) {
+            Argument *Formal = Callee->getArg(ArgIndex);
+            if (!Formal->getType()->isPointerTy())
+              continue;
+            auto Offset = getBoundPointerOffset(CB->getArgOperand(ArgIndex),
+                                                State.boundArguments, DL);
+            if (!Offset || *Offset >= View.size)
+              continue;
+            if (!hasMatchingBoundArgumentContract(
+                    *Callee, ArgIndex, BoundPeriodName, *Offset, View.size,
+                    State.mayConstFields))
+              continue;
+            Changed |= State.boundArguments.try_emplace(Formal, *Offset).second;
+          }
+        }
+      } while (Changed);
+
+      // Every mapped helper formal must be reached only through calls that
+      // carry both the same bound object and the same period identity. This
+      // fixed-point prune makes a single ambiguous edge conservatively remove
+      // the whole downstream chain.
+      do {
+        Changed = false;
+        SmallVector<const Argument *, 8> Invalid;
+        for (const auto &[Formal, ExpectedOffset] : State.boundArguments) {
+          if (Formal == RootArgument)
+            continue;
+          const Function *Callee = Formal->getParent();
+          if (Callee->hasAddressTaken()) {
+            Invalid.push_back(Formal);
+            continue;
+          }
+          auto CalleeDimension =
+              getMatchingBoundEntryDimensionArg(*Callee, BoundPeriodName);
+          if (!CalleeDimension ||
+              !hasMatchingBoundArgumentContract(
+                  *Callee, Formal->getArgNo(), BoundPeriodName, ExpectedOffset,
+                  View.size, State.mayConstFields)) {
+            Invalid.push_back(Formal);
+            continue;
+          }
+          bool SawCall = false;
+          bool AllMatch = true;
+          auto CallsIt = CallsByCallee.find(Callee);
+          if (CallsIt != CallsByCallee.end()) {
+            for (CallBase *CB : CallsIt->second) {
+              SawCall = true;
+              unsigned ArgIndex = Formal->getArgNo();
+              if (ArgIndex >= CB->arg_size()) {
+                AllMatch = false;
+                continue;
+              }
+              if (!callUsesSameBoundDimension(
+                      *CB, BoundPeriodName, *CalleeDimension,
+                      View.periodInstance ==
+                              std::numeric_limits<uint32_t>::max()
+                          ? std::nullopt
+                          : std::optional<uint8_t>(
+                                static_cast<uint8_t>(View.periodInstance)))) {
+                AllMatch = false;
+                continue;
+              }
+              auto ActualOffset = getBoundPointerOffset(
+                  CB->getArgOperand(ArgIndex), State.boundArguments, DL);
+              if (!ActualOffset || *ActualOffset != ExpectedOffset)
+                AllMatch = false;
+            }
+          }
+          if (!SawCall || !AllMatch)
+            Invalid.push_back(Formal);
+        }
+        for (const Argument *Formal : Invalid)
+          Changed |= State.boundArguments.erase(Formal);
+      } while (Changed);
+    }
+
+    boundStates_.push_back(std::move(State));
+  }
+}
+
+static bool isBoundMayConstLoad(
+    LoadInst *LI, const DenseMap<const Argument *, uint64_t> &BoundArguments,
+    ArrayRef<std::pair<uint64_t, uint64_t>> MayConstFields,
+    const DataLayout &DL) {
+  if (LI->isVolatile() || LI->isAtomic())
+    return false;
+  auto Offset =
+      getBoundPointerOffset(LI->getPointerOperand(), BoundArguments, DL);
+  if (!Offset)
+    return false;
+  if (LI->hasMetadata(MD_EJIT_MAY_CONST))
+    return true;
+
+  TypeSize AccessSize = DL.getTypeStoreSize(LI->getType());
+  if (AccessSize.isScalable())
+    return false;
+  for (const auto &[Begin, Size] : MayConstFields)
+    if (*Offset >= Begin && *Offset - Begin <= Size &&
+        AccessSize.getFixedValue() <= Size - (*Offset - Begin))
+      return true;
+  return false;
 }
 
 /// Check whether a load is (or can be treated as) a may_const access.
@@ -444,10 +768,20 @@ static Constant *createConstantFromMemory(const void *addr, Type *Ty,
     return ConstantFP::get(Ty, v);
   }
   if (Ty->isPointerTy()) {
+    const unsigned PointerSize = DL.getPointerSize(Ty->getPointerAddressSpace());
+    if (PointerSize == 0 || PointerSize > sizeof(uint64_t))
+      return nullptr;
+
     uint64_t raw = 0;
-    std::memcpy(&raw, addr, sizeof(raw));
+    const auto *Bytes = static_cast<const uint8_t *>(addr);
+    if (DL.isLittleEndian()) {
+      std::memcpy(&raw, Bytes, PointerSize);
+    } else {
+      for (unsigned I = 0; I < PointerSize; ++I)
+        raw = (raw << 8) | Bytes[I];
+    }
     return ConstantExpr::getIntToPtr(
-        ConstantInt::get(Type::getInt64Ty(Ctx), raw), Ty);
+        ConstantInt::get(IntegerType::get(Ctx, PointerSize * 8), raw), Ty);
   }
   return nullptr;
 }
@@ -532,17 +866,14 @@ static Constant *tryReplacePeriodAbsoluteAddress(
   return nullptr;
 }
 
-static Constant *tryReplaceBoundPointer(LoadInst *LI, const Function &F,
-                                        const uint8_t *Data, uint32_t Size,
-                                        uint32_t ArgIndex,
-                                        const DataLayout &DL) {
-  if (!Data || !Size || ArgIndex >= F.arg_size() ||
-      !functionBindsArgument(F, ArgIndex))
+static Constant *tryReplaceBoundPointer(
+    LoadInst *LI, const uint8_t *Data, uint32_t Size,
+    const DenseMap<const Argument *, uint64_t> &BoundArguments,
+    const DataLayout &DL) {
+  if (!Data || !Size)
     return nullptr;
-  const Argument *Root = findRootArgument(LI->getPointerOperand());
-  if (!Root || Root->getArgNo() != ArgIndex)
-    return nullptr;
-  auto Offset = accumulateArgumentOffset(DL, LI->getPointerOperand(), Root);
+  auto Offset =
+      getBoundPointerOffset(LI->getPointerOperand(), BoundArguments, DL);
   TypeSize AccessSize = DL.getTypeStoreSize(LI->getType());
   if (!Offset || AccessSize.isScalable() || *Offset > Size ||
       AccessSize.getFixedValue() > Size - *Offset)
@@ -900,7 +1231,10 @@ EJitStructFieldPass::run(Function &F, FunctionAnalysisManager &AM) {
         continue;
       }
 
-      bool BoundMayConst = isBoundMayConstLoad(LI, F, boundArgIndex_, DL);
+      bool BoundMayConst = false;
+      for (const BoundPointerState &State : boundStates_)
+        BoundMayConst |= isBoundMayConstLoad(LI, State.boundArguments,
+                                             State.mayConstFields, DL);
       if (!BoundMayConst && !isMayConstLoad(LI, mayConstFieldMap_, DL))
         continue;
 #ifdef EJIT_DIAG_ENABLE
@@ -921,11 +1255,16 @@ EJitStructFieldPass::run(Function &F, FunctionAnalysisManager &AM) {
           LI, gvPeriodMap_, mayConstFieldMap_, registry_, DL);
 
       // Pattern 0: an ejit_bound_ptr parameter. Only the marked load is read
-      // from the owned snapshot; the pointer argument and all dynamic fields
+      // from the shared object; the pointer argument and all dynamic fields
       // remain live inputs to the specialization.
-      if (!C)
-        C = tryReplaceBoundPointer(LI, F, boundData_, boundSize_,
-                                   boundArgIndex_, DL);
+      if (!C) {
+        for (const BoundPointerState &State : boundStates_) {
+          C = tryReplaceBoundPointer(LI, State.view.rawPtr, State.view.size,
+                                     State.boundArguments, DL);
+          if (C)
+            break;
+        }
+      }
 
       // Pattern 1: direct GlobalVariable load (scalar static variable).
       if (!C) {
