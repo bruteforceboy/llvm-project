@@ -1,6 +1,7 @@
 //===-- EJitStructFieldPass.cpp - JIT Constant Substitution ---------------===//
 
 #include "llvm/ExecutionEngine/EJIT/EJitStructFieldPass.h"
+#include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ExecutionEngine/EJIT/EJitDiag.h"
 #include "llvm/ExecutionEngine/EJIT/EJitVerify.h"
 #include "llvm/ADT/SmallVector.h"
@@ -22,6 +23,7 @@
 #include "llvm/Support/Debug.h"
 #include <algorithm>
 #include <cassert>
+#include <cstdint>
 #include <cstring>
 #include <limits>
 
@@ -1102,53 +1104,462 @@ tryReplacePeriodPointerBase(LoadInst *LI, const GVPeriodMap &gvMap,
   return createConstantFromMemory(PointerSlot, LI->getType(), DL);
 }
 
-/// Resolve a may_const load after IPSCCP/InstCombine has propagated a period
-/// pointer into a callee and folded its GEP into an absolute address. Accept
-/// the address only when it matches a declared may_const field of a registered
-/// pointer-form period object; arbitrary inttoptr loads must remain untouched.
-static Constant *tryReplacePeriodAbsoluteAddress(
-    LoadInst *LI, const GVPeriodMap &gvMap,
-    const MayConstOffsetMap &mayConstFieldMap, PeriodArrayRegistry &reg,
-    const DataLayout &DL) {
-  const Value *Ptr = LI->getPointerOperand();
-  APInt ExtraOffset(DL.getIndexTypeSizeInBits(Ptr->getType()), 0);
-  const Value *Base = Ptr->stripAndAccumulateConstantOffsets(
-      DL, ExtraOffset, /*AllowNonInbounds=*/true);
-
-  auto *IntToPtr = dyn_cast<ConstantExpr>(Base);
-  if (!IntToPtr || IntToPtr->getOpcode() != Instruction::IntToPtr)
-    return nullptr;
-  auto *AddressInt = dyn_cast<ConstantInt>(IntToPtr->getOperand(0));
-  if (!AddressInt)
-    return nullptr;
-
-  APInt Absolute = AddressInt->getValue().zextOrTrunc(ExtraOffset.getBitWidth());
-  Absolute += ExtraOffset;
-  uintptr_t Target = static_cast<uintptr_t>(Absolute.getZExtValue());
-
-  for (const auto &[GV, Info] : gvMap) {
-    if (!GV->getValueType()->isPointerTy())
-      continue;
-    auto FieldIt = mayConstFieldMap.find(GV);
-    if (FieldIt == mayConstFieldMap.end())
-      continue;
-
-    void *PointerSlot = resolveBase(GV, Info, reg);
-    if (!PointerSlot)
-      continue;
-    void *Pointee = nullptr;
-    std::memcpy(&Pointee, PointerSlot, sizeof(Pointee));
-    uintptr_t ObjectBase = reinterpret_cast<uintptr_t>(Pointee);
-    if (!ObjectBase || Target < ObjectBase)
-      continue;
-
-    uint64_t FieldOffset = Target - ObjectBase;
-    if (!llvm::is_contained(FieldIt->second, FieldOffset))
-      continue;
-    return createConstantFromMemory(reinterpret_cast<const void *>(Target),
-                                    LI->getType(), DL);
+/// Check the address addition rule used by a GEP with the nusw flag. The
+/// current address is truncated to the pointer index type and interpreted as
+/// unsigned, while the offset is interpreted as signed. This is deliberately
+/// not APInt::sadd_ov: the address operand is unsigned even when the offset is
+/// negative.
+static bool absoluteAddressAddSignedOffsetNoWrap(const APInt &Address,
+                                                 const APInt &Offset) {
+  assert(Address.getBitWidth() == Offset.getBitWidth());
+  if (Offset.isNegative()) {
+    APInt Magnitude = -Offset;
+    return !Address.ult(Magnitude);
   }
-  return nullptr;
+  APInt Max = APInt::getMaxValue(Address.getBitWidth());
+  return Address.ule(Max - Offset);
+}
+
+/// Compute one GEP's byte offset without calling DataLayout's int64 helper
+/// until after the index arithmetic has been checked. The latter uses signed
+/// int64 multiplication internally, so a hostile constant/index can otherwise
+/// overflow before the caller gets a chance to reject it.
+///
+/// When \p BaseAddress is supplied, also check every pointer-index arithmetic
+/// obligation carried by the GEP and optionally return the address after each
+/// individual index. This matters because a valid final address does not make
+/// an earlier flagged step valid.
+static std::optional<APInt>
+computeAbsoluteGEPOffset(const GEPOperator *GEP, const DataLayout &DL,
+                        const AssumedArgMap &Assumed,
+                        const APInt *BaseAddress = nullptr,
+                        SmallVectorImpl<APInt> *IntermediateAddresses = nullptr,
+                        bool *HasNonZeroIndex = nullptr,
+                        bool *UsedAssumption = nullptr) {
+  constexpr unsigned HostPointerBits = sizeof(uintptr_t) * 8;
+  if (!GEP->getType()->isPointerTy() ||
+      DL.getIndexTypeSizeInBits(GEP->getType()) != HostPointerBits)
+    return std::nullopt;
+
+  if (IntermediateAddresses)
+    IntermediateAddresses->clear();
+  if (HasNonZeroIndex)
+    *HasNonZeroIndex = false;
+
+  const bool HasNUSW = GEP->hasNoUnsignedSignedWrap();
+  const bool HasNUW = GEP->hasNoUnsignedWrap();
+
+  SmallVector<APInt, 4> Indices;
+  for (auto I = GEP->idx_begin(), E = GEP->idx_end(); I != E; ++I) {
+    if (const auto *CI = dyn_cast<ConstantInt>(*I)) {
+      Indices.push_back(CI->getValue());
+      continue;
+    }
+    if (Assumed.empty())
+      return std::nullopt;
+    auto Folded = evalWithAssumed(*I, Assumed, 0);
+    if (!Folded || Folded->getBitWidth() > 64)
+      return std::nullopt;
+    if (UsedAssumption)
+      *UsedAssumption = true;
+    Indices.push_back(*Folded);
+  }
+
+  APInt Result(HostPointerBits, 0);
+  APInt OffsetWithoutBase(HostPointerBits, 0);
+  APInt Current = BaseAddress ? BaseAddress->zextOrTrunc(HostPointerBits)
+                              : APInt(HostPointerBits, 0);
+  auto IndexIt = Indices.begin();
+  for (auto GTI = gep_type_begin(GEP), GTE = gep_type_end(GEP);
+       GTI != GTE; ++GTI, ++IndexIt) {
+    if (IndexIt == Indices.end())
+      return std::nullopt;
+    const APInt &RawIndex = *IndexIt;
+    if (HasNonZeroIndex && !RawIndex.isZero())
+      *HasNonZeroIndex = true;
+
+    APInt Contribution(HostPointerBits, 0);
+    if (StructType *STy = GTI.getStructTypeOrNull()) {
+      if (RawIndex.getActiveBits() > 32)
+        return std::nullopt;
+      const uint64_t FieldNo = RawIndex.getZExtValue();
+      if (FieldNo >= STy->getNumElements())
+        return std::nullopt;
+      const uint64_t FieldOffset =
+          DL.getStructLayout(STy)->getElementOffset(FieldNo);
+      if (FieldOffset > static_cast<uint64_t>(INT64_MAX))
+        return std::nullopt;
+      Contribution = APInt(HostPointerBits, FieldOffset);
+    } else {
+      TypeSize StrideSize = DL.getTypeAllocSize(GTI.getIndexedType());
+      if (StrideSize.isScalable())
+        return std::nullopt;
+      const uint64_t Stride = StrideSize.getFixedValue();
+      if (RawIndex.getBitWidth() > HostPointerBits) {
+        APInt Truncated = RawIndex.trunc(HostPointerBits);
+        if (HasNUW && Truncated.zext(RawIndex.getBitWidth()) != RawIndex)
+          return std::nullopt;
+        if (HasNUSW && Truncated.sext(RawIndex.getBitWidth()) != RawIndex)
+          return std::nullopt;
+      }
+
+      APInt Index = RawIndex.sextOrTrunc(HostPointerBits);
+      APInt StrideValue(HostPointerBits, Stride);
+      bool UnsignedMulOverflow = false;
+      bool SignedMulOverflow = false;
+      Contribution = Index * StrideValue;
+      (void)Index.umul_ov(StrideValue, UnsignedMulOverflow);
+      (void)Index.smul_ov(StrideValue, SignedMulOverflow);
+      if ((HasNUW && UnsignedMulOverflow) ||
+          (HasNUSW && SignedMulOverflow))
+        return std::nullopt;
+    }
+
+    bool UnsignedOffsetOverflow = false;
+    bool SignedOffsetOverflow = false;
+    (void)OffsetWithoutBase.uadd_ov(Contribution, UnsignedOffsetOverflow);
+    (void)OffsetWithoutBase.sadd_ov(Contribution, SignedOffsetOverflow);
+    if ((HasNUW && UnsignedOffsetOverflow) ||
+        (HasNUSW && SignedOffsetOverflow))
+      return std::nullopt;
+
+    if (BaseAddress) {
+      bool UnsignedAddressOverflow = false;
+      (void)Current.uadd_ov(Contribution, UnsignedAddressOverflow);
+      if (HasNUW && UnsignedAddressOverflow)
+        return std::nullopt;
+      if (HasNUSW &&
+          !absoluteAddressAddSignedOffsetNoWrap(Current, Contribution))
+        return std::nullopt;
+      Current = Current + Contribution;
+      if (IntermediateAddresses)
+        IntermediateAddresses->push_back(Current);
+    }
+
+    bool ResultOverflow = false;
+    Result = Result.sadd_ov(Contribution, ResultOverflow);
+    if (ResultOverflow)
+      return std::nullopt;
+    OffsetWithoutBase = OffsetWithoutBase + Contribution;
+  }
+  return Result;
+}
+
+/// Reject a cast which changes address space anywhere between the load and
+/// the absolute inttoptr root. The final pointer type alone is insufficient to
+/// establish that the pointer has the default address-space provenance.
+static bool hasIntermediateAddressSpaceCast(const Value *Ptr) {
+  SmallPtrSet<const Value *, 8> Seen;
+  const Value *V = Ptr;
+  while (V && Seen.insert(V).second) {
+    if (isa<AddrSpaceCastOperator>(V))
+      return true;
+    if (const auto *GEP = dyn_cast<GEPOperator>(V)) {
+      V = GEP->getPointerOperand();
+      continue;
+    }
+    if (const auto *BC = dyn_cast<BitCastOperator>(V)) {
+      V = BC->getOperand(0);
+      continue;
+    }
+    break;
+  }
+  return false;
+}
+
+struct AbsoluteGEPChain {
+  APInt RootAddress;
+  SmallVector<const GEPOperator *, 4> LeafToRoot;
+
+  explicit AbsoluteGEPChain(unsigned PointerBits)
+      : RootAddress(PointerBits, 0) {}
+};
+
+static std::optional<AbsoluteGEPChain>
+collectAbsoluteGEPChain(const Value *Ptr, const DataLayout &DL) {
+  constexpr unsigned HostPointerBits = sizeof(uintptr_t) * 8;
+  if (!Ptr || !Ptr->getType()->isPointerTy() ||
+      Ptr->getType()->getPointerAddressSpace() != 0 ||
+      DL.getIndexTypeSizeInBits(Ptr->getType()) != HostPointerBits ||
+      hasIntermediateAddressSpaceCast(Ptr))
+    return std::nullopt;
+
+  AbsoluteGEPChain Chain(HostPointerBits);
+  const Value *V = Ptr;
+  while (V) {
+    V = V->stripPointerCasts();
+    auto *GEP = dyn_cast<GEPOperator>(V);
+    if (!GEP)
+      break;
+    Chain.LeafToRoot.push_back(GEP);
+    V = GEP->getPointerOperand();
+  }
+
+  V = V ? V->stripPointerCasts() : nullptr;
+  auto *IntToPtr = dyn_cast_or_null<ConstantExpr>(V);
+  if (!IntToPtr || IntToPtr->getOpcode() != Instruction::IntToPtr ||
+      !IntToPtr->getType()->isPointerTy() ||
+      IntToPtr->getType()->getPointerAddressSpace() != 0)
+    return std::nullopt;
+  auto *AddressInt = dyn_cast<ConstantInt>(IntToPtr->getOperand(0));
+  if (!AddressInt || AddressInt->getValue().getActiveBits() > HostPointerBits)
+    return std::nullopt;
+  Chain.RootAddress = AddressInt->getValue().zextOrTrunc(HostPointerBits);
+  return Chain;
+}
+
+static std::optional<APInt>
+getAbsoluteTarget(const Value *Ptr, const DataLayout &DL,
+                 const AssumedArgMap &Assumed, bool *UsedAssumption = nullptr) {
+  constexpr unsigned HostPointerBits = sizeof(uintptr_t) * 8;
+  auto Chain = collectAbsoluteGEPChain(Ptr, DL);
+  if (!Chain)
+    return std::nullopt;
+
+  APInt Offset(HostPointerBits, 0);
+  APInt Current = Chain->RootAddress;
+  for (auto It = Chain->LeafToRoot.rbegin(); It != Chain->LeafToRoot.rend();
+       ++It) {
+    const GEPOperator *GEP = *It;
+    bool GEPUsedAssumption = false;
+    auto GEPOffset = computeAbsoluteGEPOffset(
+        GEP, DL, Assumed, &Current, nullptr, nullptr, &GEPUsedAssumption);
+    if (!GEPOffset)
+      return std::nullopt;
+    bool Overflow = false;
+    Offset = Offset.sadd_ov(*GEPOffset, Overflow);
+    if (Overflow)
+      return std::nullopt;
+    if (UsedAssumption)
+      *UsedAssumption |= GEPUsedAssumption;
+    Current = Current + *GEPOffset;
+  }
+
+  APInt Target = Chain->RootAddress;
+  if (Offset.isNegative()) {
+    APInt Magnitude = -Offset;
+    if (Target.ult(Magnitude))
+      return std::nullopt;
+    Target -= Magnitude;
+  } else {
+    bool Overflow = false;
+    Target = Target.uadd_ov(Offset, Overflow);
+    if (Overflow)
+      return std::nullopt;
+  }
+  return Target;
+}
+
+static bool hasAbsoluteAddressContract(const Function &F,
+                                       StringRef PeriodName) {
+  if (!hasMDStringEntry(F.getMetadata(MD_EJIT_METADATA), TAG_EJIT_ENTRY))
+    return false;
+  return PeriodName == "static" ||
+         getMatchingBoundEntryDimensionArg(F, PeriodName).has_value();
+}
+
+struct RegisteredAbsoluteObject {
+  const uint8_t *base = nullptr;
+  uint64_t size = 0;
+  bool isArray = false;
+};
+
+static std::optional<RegisteredAbsoluteObject>
+getRegisteredNonPointerObject(const GlobalVariable *GV,
+                              const GVPeriodInfo &Info,
+                              PeriodArrayRegistry &Reg,
+                              const DataLayout &DL) {
+  Type *ValueTy = GV->getValueType();
+  if (!ValueTy || ValueTy->isPointerTy() || !ValueTy->isSized())
+    return std::nullopt;
+  TypeSize ObjectSize = DL.getTypeAllocSize(ValueTy);
+  if (ObjectSize.isScalable() || !ObjectSize.getFixedValue())
+    return std::nullopt;
+
+  if (Info.isArray) {
+    auto *ArrayTy = dyn_cast<ArrayType>(ValueTy);
+    if (!ArrayTy || !Info.arraySize ||
+        ArrayTy->getNumElements() != Info.arraySize)
+      return std::nullopt;
+    const PeriodArrayInfo *Registered =
+        Reg.getArrayInfo(GV->getName().str());
+    if (!Registered || Registered->periodName != Info.periodName ||
+        Registered->arraySize != Info.arraySize || !Registered->baseAddr)
+      return std::nullopt;
+    return RegisteredAbsoluteObject{
+        static_cast<const uint8_t *>(Registered->baseAddr),
+        ObjectSize.getFixedValue(), true};
+  }
+
+  void *Address = Reg.getStaticVarAddr(GV->getName().str());
+  if (!Address)
+    return std::nullopt;
+  return RegisteredAbsoluteObject{static_cast<const uint8_t *>(Address),
+                                  ObjectSize.getFixedValue(), false};
+}
+
+static bool absoluteRangeContains(uintptr_t Base, uint64_t ObjectSize,
+                                  uintptr_t Target, uint64_t AccessSize,
+                                  uint64_t &Relative) {
+  if (ObjectSize > std::numeric_limits<uintptr_t>::max() - Base ||
+      Target < Base)
+    return false;
+  const uintptr_t End = Base + static_cast<uintptr_t>(ObjectSize);
+  if (Target > End)
+    return false;
+  Relative = static_cast<uint64_t>(Target - Base);
+  return AccessSize <= ObjectSize - Relative;
+}
+
+static bool absoluteAddressInObject(const APInt &Address, uintptr_t ObjectBase,
+                                    uint64_t ObjectSize) {
+  if (ObjectSize > std::numeric_limits<uintptr_t>::max() - ObjectBase)
+    return false;
+  const uintptr_t End = ObjectBase + static_cast<uintptr_t>(ObjectSize);
+  const uintptr_t Value = static_cast<uintptr_t>(Address.getZExtValue());
+  return Value >= ObjectBase && Value <= End;
+}
+
+/// Validate the root-to-leaf obligations of inbounds GEPs against the one
+/// registered object being considered. A physically valid final address is
+/// insufficient: every flagged intermediate address must stay within the
+/// same allocation, and an inbounds GEP's base must already be in that
+/// allocation (or one-past it).
+static bool absoluteGEPChainFitsObject(const Value *Ptr, const DataLayout &DL,
+                                       const AssumedArgMap &Assumed,
+                                       uintptr_t ObjectBase,
+                                       uint64_t ObjectSize) {
+  auto Chain = collectAbsoluteGEPChain(Ptr, DL);
+  if (!Chain)
+    return false;
+
+  APInt Current = Chain->RootAddress;
+  for (auto It = Chain->LeafToRoot.rbegin(); It != Chain->LeafToRoot.rend();
+       ++It) {
+    const GEPOperator *GEP = *It;
+    SmallVector<APInt, 4> IntermediateAddresses;
+    bool HasNonZeroIndex = false;
+    auto Offset = computeAbsoluteGEPOffset(
+        GEP, DL, Assumed, &Current, &IntermediateAddresses,
+        &HasNonZeroIndex);
+    if (!Offset)
+      return false;
+
+    if (GEP->isInBounds() && HasNonZeroIndex) {
+      if (!absoluteAddressInObject(Current, ObjectBase, ObjectSize))
+        return false;
+      for (const APInt &Address : IntermediateAddresses)
+        if (!absoluteAddressInObject(Address, ObjectBase, ObjectSize))
+          return false;
+    }
+    Current = Current + *Offset;
+  }
+  return true;
+}
+
+static bool absoluteFieldAuthorized(
+    const GlobalVariable *GV, const GVPeriodInfo &Info,
+    const MayConstOffsetMap &MayConstFieldMap, uint64_t Relative,
+    uint64_t AccessSize, const DataLayout &DL) {
+  auto FieldIt = MayConstFieldMap.find(GV);
+  if (FieldIt == MayConstFieldMap.end())
+    return false;
+  uint64_t FieldOffset = Relative;
+  if (Info.isArray) {
+    auto *ArrayTy = dyn_cast<ArrayType>(GV->getValueType());
+    if (!ArrayTy)
+      return false;
+    TypeSize ElementSize = DL.getTypeAllocSize(ArrayTy->getElementType());
+    if (ElementSize.isScalable() || !ElementSize.getFixedValue())
+      return false;
+    FieldOffset %= ElementSize.getFixedValue();
+  }
+  return llvm::is_contained(FieldIt->second, FieldOffset) &&
+         ejitAccessFitsMayConstField(GV, FieldOffset, AccessSize, DL);
+}
+
+/// Resolve a may_const load after IPSCCP/InstCombine has propagated a period
+/// pointer into a callee and folded its GEP into an absolute address. For a
+/// non-pointer registered object, accept only a unique, bounded and authorized
+/// field whose complete root-to-leaf GEP witness is valid. Pointer-form objects
+/// retain the old exact-field/constant-index path; their pointee extent is not
+/// present in the registry, so a free-dim witness is never used for them.
+static Constant *tryReplacePeriodAbsoluteAddress(
+    LoadInst *LI, const Function &F, const GVPeriodMap &gvMap,
+    const MayConstOffsetMap &mayConstFieldMap, PeriodArrayRegistry &reg,
+    const DataLayout &DL, const AssumedArgMap &Assumed) {
+  if (LI->isVolatile() || LI->isAtomic())
+    return nullptr;
+  TypeSize AccessTypeSize = DL.getTypeStoreSize(LI->getType());
+  if (AccessTypeSize.isScalable() || !AccessTypeSize.getFixedValue())
+    return nullptr;
+  const uint64_t AccessSize = AccessTypeSize.getFixedValue();
+  bool UsedAssumption = false;
+  auto TargetValue = getAbsoluteTarget(LI->getPointerOperand(), DL, Assumed,
+                                        &UsedAssumption);
+  if (!TargetValue)
+    return nullptr;
+  const uintptr_t Target =
+      static_cast<uintptr_t>(TargetValue->getZExtValue());
+
+  unsigned Matches = 0;
+  const uint8_t *Candidate = nullptr;
+  for (const auto &[GV, Info] : gvMap) {
+    if (GV->getValueType()->isPointerTy()) {
+      // Preserve the pre-existing constant-address path for pointer-valued
+      // periods. It deliberately does not require the helper itself to carry
+      // the consuming entry's lifecycle metadata: the pointer materialization
+      // and the old absolute-address fold are also used through non-inlined
+      // helpers. The pointee's complete extent is unknown, so this path cannot
+      // consume a free-dim witness.
+      if (UsedAssumption || DL.getPointerSize(0) != sizeof(void *))
+        continue;
+      void *PointerSlot = resolveBase(GV, Info, reg);
+      if (!PointerSlot)
+        continue;
+      void *Pointee = nullptr;
+      std::memcpy(&Pointee, PointerSlot, sizeof(Pointee));
+      const uintptr_t PointeeBase = reinterpret_cast<uintptr_t>(Pointee);
+      if (!PointeeBase || Target < PointeeBase)
+        continue;
+      const uint64_t FieldOffset = Target - PointeeBase;
+      auto FieldIt = mayConstFieldMap.find(GV);
+      if (FieldIt == mayConstFieldMap.end() ||
+          !llvm::is_contained(FieldIt->second, FieldOffset) ||
+          AccessSize > std::numeric_limits<uintptr_t>::max() - Target)
+        continue;
+      Candidate = reinterpret_cast<const uint8_t *>(Target);
+      ++Matches;
+      continue;
+    }
+
+    if (!hasAbsoluteAddressContract(F, Info.periodName))
+      continue;
+    auto Object = getRegisteredNonPointerObject(GV, Info, reg, DL);
+    if (!Object)
+      continue;
+    uint64_t Relative = 0;
+    const uintptr_t ObjectBase = reinterpret_cast<uintptr_t>(Object->base);
+    if (!absoluteRangeContains(ObjectBase, Object->size, Target, AccessSize,
+                               Relative) ||
+        !absoluteGEPChainFitsObject(LI->getPointerOperand(), DL, Assumed,
+                                    ObjectBase, Object->size) ||
+        !absoluteFieldAuthorized(GV, Info, mayConstFieldMap, Relative,
+                                 AccessSize, DL))
+      continue;
+    Candidate = reinterpret_cast<const uint8_t *>(Target);
+    ++Matches;
+  }
+
+  // The contract is a unique eligible registration, not unique physical
+  // storage. Physically overlapping bytes are safe to use only when every
+  // other registration is ineligible for this consuming entry's lifecycle and
+  // authorized field; that alias/lifetime precondition is what prevents an
+  // arbitrary map entry from winning. Cross-lifecycle or otherwise eligible
+  // overlap remains ambiguous.
+  if (Matches != 1)
+    return nullptr;
+  return createConstantFromMemory(Candidate, LI->getType(), DL);
 }
 
 static Constant *tryReplaceBoundPointer(LoadInst *LI, const uint8_t *Data,
@@ -1600,7 +2011,8 @@ EJitStructFieldPass::run(Function &F, FunctionAnalysisManager &AM) {
 
       // Try each access pattern in order.
       Constant *C = tryReplacePeriodAbsoluteAddress(
-          LI, gvPeriodMap_, mayConstFieldMap_, registry_, DL);
+          LI, F, gvPeriodMap_, mayConstFieldMap_, registry_, DL,
+          freeDimArgs_);
 
       // Pattern 0: an ejit_bound_ptr parameter. Only the marked load is read
       // from the shared object; the pointer argument and all dynamic fields

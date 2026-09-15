@@ -31,12 +31,14 @@
 #include "llvm/ExecutionEngine/EJIT/EJitTaskPool.h"
 #endif
 #include "llvm/AsmParser/Parser.h"
+#include "llvm/Analysis/ConstantFolding.h"
 #include "llvm/Bitcode/BitcodeWriter.h"
 #include "llvm/IR/BasicBlock.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/InstIterator.h"
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
+#include "llvm/Transforms/Utils/Local.h"
 #include "llvm/Passes/PassBuilder.h"
 #include "llvm/Support/Error.h"
 #include "llvm/Support/SourceMgr.h"
@@ -45,6 +47,8 @@
 #ifndef EJIT_FREESTANDING
 #include <thread>
 #endif
+#include <cstddef>
+#include <set>
 
 using namespace llvm;
 using namespace llvm::ejit;
@@ -5146,4 +5150,922 @@ TEST(EJitDiagnostics, PrintActiveNoCrash) {
 // asserts it does not crash; the version/commit are baked in at compile time.
 TEST(EJitDiagnostics, PrintVersionNoCrash) {
   ejit_print_version();
+}
+//===----------------------------------------------------------------------===//
+// IR-01 absolute-address regression tests
+//===----------------------------------------------------------------------===//
+
+static std::unique_ptr<Module> parseIR01TestModule(LLVMContext &Ctx,
+                                                   const std::string &IR) {
+  SMDiagnostic Error;
+  auto M = parseAssemblyString(IR, Error, Ctx);
+  if (!M) {
+    Error.print("IR01", errs());
+    return nullptr;
+  }
+  M->setTargetTriple(Triple("x86_64-unknown-linux-gnu"));
+  M->setDataLayout("e-p:64:64-i64:64-n8:16:32:64-S128");
+  if (verifyModule(*M, &errs()))
+    return nullptr;
+  return M;
+}
+
+struct IR01Record {
+  uint64_t Frozen;
+  uint64_t Live;
+};
+static_assert(sizeof(IR01Record) == 16 && offsetof(IR01Record, Live) == 8);
+
+static std::unique_ptr<Module>
+createIR01FreeDimModule(LLVMContext &Ctx, uintptr_t Base, unsigned Modulus,
+                        bool IsStatic, bool WithFreeDim) {
+  std::ostringstream IR;
+  IR << "%IR01Record = type { i64, i64 }\n"
+        "@cfg = external global [" << Modulus
+     << " x %IR01Record], !ejit.metadata !0\n"
+        "declare void @sink_yes(i16)\n"
+        "declare void @sink_no(i16)\n"
+        "define i64 @probe(i8 %cell, i16 %slot) !ejit.metadata !3 {\n"
+        "entry:\n"
+     << "  %phase = urem i16 %slot, " << Modulus << "\n"
+        "  %idx = zext i16 %phase to i64\n"
+        "  %selected = getelementptr inbounds nuw ["
+     << Modulus << " x %IR01Record], ptr inttoptr (i64 "
+     << static_cast<uint64_t>(Base)
+     << " to ptr), i64 0, i64 %idx, i32 0\n"
+        "  %live_row = getelementptr inbounds nuw ["
+     << Modulus << " x %IR01Record], ptr inttoptr (i64 "
+     << static_cast<uint64_t>(Base)
+     << " to ptr), i64 0, i64 %idx\n"
+        "  %live = getelementptr inbounds nuw %IR01Record, ptr %live_row, "
+        "i64 0, i32 1\n"
+        "  %live_value = zext i16 %slot to i64\n"
+        "  store i64 %live_value, ptr %live, align 8\n"
+        "  %word = load i64, ptr %selected, align 8, !ejit.may_const !7\n"
+        "  %masked = and i64 %word, 4096\n"
+        "  %condition = icmp ne i64 %masked, 0\n"
+        "  br i1 %condition, label %yes, label %no\n"
+        "yes:\n"
+        "  call void @sink_yes(i16 %slot)\n"
+        "  ret i64 %word\n"
+        "no:\n"
+        "  call void @sink_no(i16 %slot)\n"
+        "  ret i64 0\n"
+        "}\n"
+        "!0 = !{!1, !2}\n"
+        "!2 = !{!\"ejit_may_const_field\", i64 0}\n"
+        "!3 = distinct !{!4";
+  if (!IsStatic)
+    IR << ", !5";
+  if (WithFreeDim)
+    IR << ", !6";
+  IR << "}\n!4 = !{!\"ejit_entry\"}\n";
+  if (IsStatic)
+    IR << "!1 = !{!\"ejit_period\", !\"static\"}\n";
+  else
+    IR << "!1 = !{!\"ejit_period_arr\", !\"cell\", i32 " << Modulus
+       << "}\n!5 = !{!\"ejit_period_arr_ind\", !\"cell\", i32 0}\n";
+  if (WithFreeDim)
+    IR << "!6 = !{!\"ejit_free_dim\", !\"\", i32 1}\n";
+  IR << "!7 = !{}\n";
+  return parseIR01TestModule(Ctx, IR.str());
+}
+
+static void foldIR01Constants(Function &F, Module &M) {
+  for (unsigned Round = 0; Round != 2; ++Round) {
+    for (BasicBlock &BB : F) {
+      for (auto It = BB.begin(); It != BB.end();) {
+        Instruction *I = &*It++;
+        if (I->isTerminator() || I->getType()->isVoidTy())
+          continue;
+        if (Constant *C = ConstantFoldInstruction(I, M.getDataLayout())) {
+          I->replaceAllUsesWith(C);
+          I->eraseFromParent();
+        }
+      }
+      ConstantFoldTerminator(&BB, true);
+    }
+    removeUnreachableBlocks(F);
+  }
+}
+
+static bool ir01DependsOn(const Value *V, const Argument *Arg,
+                          std::set<const Value *> &Seen) {
+  if (V == Arg)
+    return true;
+  if (!Seen.insert(V).second)
+    return false;
+  if (const auto *U = dyn_cast<User>(V))
+    for (const Use &Operand : U->operands())
+      if (ir01DependsOn(Operand.get(), Arg, Seen))
+        return true;
+  return false;
+}
+
+TEST(EJitStructFieldPass, AbsoluteAddressWithFreeDimFoldsN5N10) {
+  for (unsigned Modulus : {5U, 10U}) {
+    for (bool IsStatic : {false, true}) {
+      SCOPED_TRACE(std::string(IsStatic ? "static" : "array") + "/N" +
+                   std::to_string(Modulus));
+      std::array<IR01Record, 10> Data{};
+      for (unsigned I = 0; I != Data.size(); ++I)
+        Data[I] = {4096, I};
+
+      LLVMContext Ctx;
+      auto M = createIR01FreeDimModule(Ctx,
+                                       reinterpret_cast<uintptr_t>(Data.data()),
+                                       Modulus, IsStatic, true);
+      ASSERT_NE(M, nullptr);
+      PeriodArrayRegistry Registry;
+      if (IsStatic)
+        Registry.registerStaticVar("cfg", Data.data());
+      else
+        Registry.registerArray("cell", "cfg", Data.data(), Modulus);
+
+      Function *F = M->getFunction("probe");
+      ASSERT_NE(F, nullptr);
+      EJitStructFieldPass Pass(Registry);
+      Pass.initFromModule(*M);
+      ASSERT_TRUE(runStructFieldOn(*F, Pass));
+      foldIR01Constants(*F, *M);
+
+      auto *Ret = dyn_cast<ReturnInst>(F->back().getTerminator());
+      ASSERT_NE(Ret, nullptr);
+      auto *RetValue = dyn_cast<ConstantInt>(Ret->getReturnValue());
+      ASSERT_NE(RetValue, nullptr)
+          << "registered absolute free_dim address did not fold";
+      EXPECT_EQ(RetValue->getZExtValue(), 4096u);
+      EXPECT_EQ(countLoads(*F), 0u);
+
+      unsigned ConditionalBranches = 0;
+      bool LiveStore = false;
+      bool RawSlotCall = false;
+      for (Instruction &I : instructions(*F)) {
+        if (auto *BI = dyn_cast<BranchInst>(&I))
+          ConditionalBranches += BI->isConditional();
+        if (auto *SI = dyn_cast<StoreInst>(&I)) {
+          std::set<const Value *> Seen;
+          LiveStore |= ir01DependsOn(SI->getPointerOperand(), F->getArg(1),
+                                     Seen);
+        }
+        if (auto *CI = dyn_cast<CallInst>(&I))
+          RawSlotCall |= CI->arg_size() == 1 &&
+                         CI->getArgOperand(0) == F->getArg(1) &&
+                         CI->getCalledFunction() &&
+                         CI->getCalledFunction()->getName() == "sink_yes";
+      }
+      EXPECT_EQ(ConditionalBranches, 0u);
+      EXPECT_TRUE(LiveStore);
+      EXPECT_TRUE(RawSlotCall);
+    }
+  }
+}
+
+TEST(EJitStructFieldPass, AbsoluteAddressWithoutFreeDimDoesNotFold) {
+  for (unsigned Modulus : {5U, 10U}) {
+    SCOPED_TRACE(std::string("array/N") + std::to_string(Modulus));
+    std::array<IR01Record, 10> Data{};
+    for (unsigned I = 0; I != Data.size(); ++I)
+      Data[I] = {4096, I};
+    LLVMContext Ctx;
+    auto M = createIR01FreeDimModule(
+        Ctx, reinterpret_cast<uintptr_t>(Data.data()), Modulus, false, false);
+    ASSERT_NE(M, nullptr);
+    PeriodArrayRegistry Registry;
+    Registry.registerArray("cell", "cfg", Data.data(), Modulus);
+    Function *F = M->getFunction("probe");
+    ASSERT_NE(F, nullptr);
+    EJitStructFieldPass Pass(Registry);
+    Pass.initFromModule(*M);
+    runStructFieldOn(*F, Pass);
+
+    unsigned ConditionalBranches = 0;
+    for (Instruction &I : instructions(*F))
+      if (auto *BI = dyn_cast<BranchInst>(&I))
+        ConditionalBranches += BI->isConditional();
+    EXPECT_EQ(countLoads(*F), 1u);
+    EXPECT_EQ(ConditionalBranches, 1u);
+  }
+}
+
+/// The old absolute-address pointer path accepts both registerArray and
+/// registerStaticVar, and it is allowed to run in an unannotated helper. The
+/// consuming entry carries the lifecycle contract; the helper need not grow a
+/// duplicate entry annotation merely because it was not inlined.
+TEST(EJitStructFieldPass,
+     AbsolutePointerPreservesStaticRegistrationAndHelperPath) {
+  for (bool IsStatic : {false, true}) {
+    for (bool InHelper : {false, true}) {
+      SCOPED_TRACE(std::string(IsStatic ? "static" : "array") +
+                   (InHelper ? "/helper" : "/entry"));
+      uint64_t Data = 4096;
+      uint64_t *Slot = &Data;
+      std::ostringstream IR;
+      IR << "@cfg = external global ptr, !ejit.metadata !0\n"
+            "define "
+         << (InHelper ? "internal " : "")
+         << "i64 @probe(i8 %cell, i16 %slot) "
+         << (InHelper ? "" : "!ejit.metadata !3") << " {\n"
+            "entry:\n"
+            "  %v = load i64, ptr inttoptr (i64 "
+         << reinterpret_cast<uintptr_t>(&Data)
+         << " to ptr), align 8, !ejit.may_const !7\n"
+            "  ret i64 %v\n"
+            "}\n";
+      if (InHelper)
+        IR << "define i64 @caller(i8 %cell, i16 %slot) !ejit.metadata !3 {\n"
+              "entry:\n"
+              "  %v = call i64 @probe(i8 %cell, i16 %slot)\n"
+              "  ret i64 %v\n"
+              "}\n";
+      IR << "!0 = !{!1, !2}\n!1 = !{!\""
+         << (IsStatic ? "ejit_period\", !\"static\"" :
+                         "ejit_period_arr\", !\"cell\", i32 1")
+         << "}\n!2 = !{!\"ejit_may_const_field\", i64 0}\n"
+            "!3 = distinct !{!4, !5}\n!4 = !{!\"ejit_entry\"}\n"
+            "!5 = !{!\"ejit_period_arr_ind\", !\"cell\", i32 0}\n"
+            "!7 = !{}\n";
+
+      LLVMContext Ctx;
+      auto M = parseIR01TestModule(Ctx, IR.str());
+      ASSERT_NE(M, nullptr);
+      PeriodArrayRegistry Registry;
+      if (IsStatic)
+        Registry.registerStaticVar("cfg", &Slot);
+      else
+        Registry.registerArray("cell", "cfg", &Slot, 1);
+
+      Function *Probe = M->getFunction("probe");
+      ASSERT_NE(Probe, nullptr);
+      EJitStructFieldPass Pass(Registry);
+      Pass.initFromModule(*M);
+      runStructFieldOn(*Probe, Pass);
+
+      auto *Ret = dyn_cast<ReturnInst>(Probe->back().getTerminator());
+      ASSERT_NE(Ret, nullptr);
+      auto *Value = dyn_cast<ConstantInt>(Ret->getReturnValue());
+      ASSERT_NE(Value, nullptr)
+          << "legacy constant-address pointer path regressed";
+      EXPECT_EQ(Value->getZExtValue(), 4096u);
+    }
+  }
+}
+
+/// A supported i64 load must not be authorized merely because it begins at a
+/// marked i32 field: the adjacent i32 is live and must not be frozen with it.
+TEST(EJitStructFieldPass, AbsoluteAddressRejectsCrossFieldSupportedWidth) {
+  struct Pair {
+    int32_t Frozen;
+    int32_t Live;
+  } Data = {11, 29};
+  std::ostringstream IR;
+  IR << "@cfg = external global { i32, i32 }, !ejit.metadata !0\n"
+        "define i64 @probe() !ejit.metadata !3 {\n"
+        "entry:\n"
+        "  %v = load i64, ptr inttoptr (i64 "
+     << reinterpret_cast<uintptr_t>(&Data)
+     << " to ptr), align 8, !ejit.may_const !7\n"
+        "  ret i64 %v\n"
+        "}\n"
+        "!0 = !{!1, !2}\n"
+        "!1 = !{!\"ejit_period\", !\"static\"}\n"
+        "!2 = !{!\"ejit_may_const_field\", i64 0}\n"
+        "!3 = distinct !{!4}\n!4 = !{!\"ejit_entry\"}\n"
+        "!7 = !{}\n";
+
+  LLVMContext Ctx;
+  auto M = parseIR01TestModule(Ctx, IR.str());
+  ASSERT_NE(M, nullptr);
+  PeriodArrayRegistry Registry;
+  Registry.registerStaticVar("cfg", &Data);
+  Function *F = M->getFunction("probe");
+  ASSERT_NE(F, nullptr);
+  EJitStructFieldPass Pass(Registry);
+  Pass.initFromModule(*M);
+  runStructFieldOn(*F, Pass);
+
+  EXPECT_EQ(countLoads(*F), 1u)
+      << "i64 access spanning marked i32 and adjacent live i32 was folded";
+  auto *Ret = dyn_cast<ReturnInst>(F->back().getTerminator());
+  ASSERT_NE(Ret, nullptr);
+  EXPECT_TRUE(isa<LoadInst>(Ret->getReturnValue()));
+}
+
+TEST(EJitStructFieldPass, AbsoluteAddressRejectsVolatileAndAtomicLoads) {
+  uint64_t Data = 4096;
+  std::ostringstream IR;
+  IR << "@cfg = external global i64, !ejit.metadata !0\n"
+        "define i64 @probe() !ejit.metadata !3 {\n"
+        "entry:\n"
+        "  %v = load volatile i64, ptr inttoptr (i64 "
+     << reinterpret_cast<uintptr_t>(&Data)
+     << " to ptr), align 8, !ejit.may_const !7\n"
+        "  %a = load atomic i64, ptr inttoptr (i64 "
+     << reinterpret_cast<uintptr_t>(&Data)
+     << " to ptr) monotonic, align 8, !ejit.may_const !7\n"
+        "  %sum = add i64 %v, %a\n"
+        "  ret i64 %sum\n"
+        "}\n"
+        "!0 = !{!1, !2}\n"
+        "!1 = !{!\"ejit_period\", !\"static\"}\n"
+        "!2 = !{!\"ejit_may_const_field\", i64 0}\n"
+        "!3 = distinct !{!4}\n!4 = !{!\"ejit_entry\"}\n"
+        "!7 = !{}\n";
+
+  LLVMContext Ctx;
+  auto M = parseIR01TestModule(Ctx, IR.str());
+  ASSERT_NE(M, nullptr);
+  PeriodArrayRegistry Registry;
+  Registry.registerStaticVar("cfg", &Data);
+  Function *F = M->getFunction("probe");
+  ASSERT_NE(F, nullptr);
+  EJitStructFieldPass Pass(Registry);
+  Pass.initFromModule(*M);
+  runStructFieldOn(*F, Pass);
+  EXPECT_EQ(countLoads(*F), 2u)
+      << "volatile/atomic absolute loads were folded through the witness";
+}
+
+/// Two lifecycle identities point at the same registered bytes and both
+/// authorize the same field; a third overlapping object has a different field
+/// authorization. The first two must make provenance ambiguous, not give the
+/// pass permission to choose one map entry.
+TEST(EJitStructFieldPass, AbsoluteAddressRejectsOverlappingRegistrations) {
+  uint64_t Data[2] = {4096, 8192};
+  std::ostringstream IR;
+  IR << "@cfg_a = external global [1 x i64], !ejit.metadata !0\n"
+        "@cfg_b = external global [1 x i64], !ejit.metadata !3\n"
+        "@cfg_c = external global [2 x i64], !ejit.metadata !6\n"
+        "define i64 @probe(i8 %cell, i8 %trp, i8 %other) "
+        "!ejit.metadata !13 {\n"
+        "entry:\n"
+        "  %v = load i64, ptr inttoptr (i64 "
+     << reinterpret_cast<uintptr_t>(Data)
+     << " to ptr), align 8, !ejit.may_const !14\n"
+        "  ret i64 %v\n"
+        "}\n"
+        "!0 = !{!1, !2}\n"
+        "!1 = !{!\"ejit_period_arr\", !\"cell\", i32 1}\n"
+        "!2 = !{!\"ejit_may_const_field\", i64 0}\n"
+        "!3 = !{!4, !2}\n"
+        "!4 = !{!\"ejit_period_arr\", !\"trp\", i32 1}\n"
+        "!6 = !{!7, !8}\n"
+        "!7 = !{!\"ejit_period_arr\", !\"other\", i32 2}\n"
+        "!8 = !{!\"ejit_may_const_field\", i64 8}\n"
+        "!13 = distinct !{!9, !10, !11, !12}\n"
+        "!9 = !{!\"ejit_entry\"}\n"
+        "!10 = !{!\"ejit_period_arr_ind\", !\"cell\", i32 0}\n"
+        "!11 = !{!\"ejit_period_arr_ind\", !\"trp\", i32 1}\n"
+        "!12 = !{!\"ejit_period_arr_ind\", !\"other\", i32 2}\n"
+        "!14 = !{}\n";
+
+  LLVMContext Ctx;
+  auto M = parseIR01TestModule(Ctx, IR.str());
+  ASSERT_NE(M, nullptr);
+  PeriodArrayRegistry Registry;
+  Registry.registerArray("cell", "cfg_a", Data, 1);
+  Registry.registerArray("trp", "cfg_b", Data, 1);
+  Registry.registerArray("other", "cfg_c", Data, 2);
+  Function *F = M->getFunction("probe");
+  ASSERT_NE(F, nullptr);
+  EJitStructFieldPass Pass(Registry);
+  Pass.initFromModule(*M);
+  runStructFieldOn(*F, Pass);
+  EXPECT_EQ(countLoads(*F), 1u)
+      << "overlapping registrations were treated as unique provenance";
+}
+
+enum class IR01OverlapCase { Single, BothAuthorize, SecondDifferentFieldNoContract };
+
+static std::unique_ptr<Module>
+createIR01OverlapModule(LLVMContext &Ctx, uintptr_t Base,
+                        IR01OverlapCase Case) {
+  const bool HasSecond = Case != IR01OverlapCase::Single;
+  const bool SecondAuthorizes = Case == IR01OverlapCase::BothAuthorize;
+  std::ostringstream IR;
+  IR << "%IR01OverlapRecord = type { i64, i64 }\n"
+        "@cfg_a = external global [1 x %IR01OverlapRecord], !ejit.metadata !0\n";
+  if (HasSecond)
+    IR << "@cfg_b = external global [1 x %IR01OverlapRecord], !ejit.metadata !3\n";
+  IR << "define i64 @probe(i8 %cell, i8 %trp) !ejit.metadata !6 {\n"
+        "entry:\n"
+        "  %v = load i64, ptr inttoptr (i64 "
+     << static_cast<uint64_t>(Base)
+     << " to ptr), align 8, !ejit.may_const !7\n"
+        "  ret i64 %v\n"
+        "}\n"
+        "!0 = !{!1, !2}\n"
+        "!1 = !{!\"ejit_period_arr\", !\"cell\", i32 1}\n"
+        "!2 = !{!\"ejit_may_const_field\", i64 0}\n";
+  if (HasSecond) {
+    IR << "!3 = !{!4, !5}\n"
+       << "!4 = !{!\"ejit_period_arr\", !\"trp\", i32 1}\n"
+       << "!5 = !{!\"ejit_may_const_field\", i64 "
+       << (SecondAuthorizes ? 0 : 8) << "}\n";
+  }
+  IR << "!6 = distinct !{!8, !9";
+  if (SecondAuthorizes)
+    IR << ", !10";
+  IR << "}\n!8 = !{!\"ejit_entry\"}\n"
+        "!9 = !{!\"ejit_period_arr_ind\", !\"cell\", i32 0}\n";
+  if (SecondAuthorizes)
+    IR << "!10 = !{!\"ejit_period_arr_ind\", !\"trp\", i32 1}\n";
+  IR << "!7 = !{}\n";
+  return parseIR01TestModule(Ctx, IR.str());
+}
+
+TEST(EJitStructFieldPass, AbsoluteAddressSingleRegistrationFolds) {
+  IR01Record Data = {4096, 17};
+  LLVMContext Ctx;
+  auto M = createIR01OverlapModule(
+      Ctx, reinterpret_cast<uintptr_t>(&Data), IR01OverlapCase::Single);
+  ASSERT_NE(M, nullptr);
+  PeriodArrayRegistry Registry;
+  Registry.registerArray("cell", "cfg_a", &Data, 1);
+  Function *F = M->getFunction("probe");
+  ASSERT_NE(F, nullptr);
+  EJitStructFieldPass Pass(Registry);
+  Pass.initFromModule(*M);
+  runStructFieldOn(*F, Pass);
+  auto *Ret = dyn_cast<ReturnInst>(F->back().getTerminator());
+  ASSERT_NE(Ret, nullptr);
+  auto *Value = dyn_cast<ConstantInt>(Ret->getReturnValue());
+  ASSERT_NE(Value, nullptr);
+  EXPECT_EQ(Value->getZExtValue(), 4096u);
+  EXPECT_EQ(countLoads(*F), 0u);
+}
+
+/// Exactly two genuinely valid registered objects cover the address and both
+/// authorize offset zero. The bounded non-pointer route must reject the
+/// ambiguous provenance before reading either object.
+TEST(EJitStructFieldPass, AbsoluteAddressRejectsTwoValidOverlaps) {
+  IR01Record Data = {4096, 17};
+  LLVMContext Ctx;
+  auto M = createIR01OverlapModule(
+      Ctx, reinterpret_cast<uintptr_t>(&Data), IR01OverlapCase::BothAuthorize);
+  ASSERT_NE(M, nullptr);
+  PeriodArrayRegistry Registry;
+  Registry.registerArray("cell", "cfg_a", &Data, 1);
+  Registry.registerArray("trp", "cfg_b", &Data, 1);
+  Function *F = M->getFunction("probe");
+  ASSERT_NE(F, nullptr);
+  EJitStructFieldPass Pass(Registry);
+  Pass.initFromModule(*M);
+  runStructFieldOn(*F, Pass);
+  EXPECT_EQ(countLoads(*F), 1u)
+      << "two valid overlapping registrations were treated as unique";
+}
+
+/// A second range may overlap physically but is not an eligible identity: it
+/// lacks the consuming lifecycle contract and authorizes a different field.
+/// The first, uniquely eligible registration is still allowed to fold.
+TEST(EJitStructFieldPass, AbsoluteAddressFoldsWithIneligibleOverlap) {
+  IR01Record Data = {4096, 17};
+  LLVMContext Ctx;
+  auto M = createIR01OverlapModule(
+      Ctx, reinterpret_cast<uintptr_t>(&Data),
+      IR01OverlapCase::SecondDifferentFieldNoContract);
+  ASSERT_NE(M, nullptr);
+  PeriodArrayRegistry Registry;
+  Registry.registerArray("cell", "cfg_a", &Data, 1);
+  Registry.registerArray("trp", "cfg_b", &Data, 1);
+  Function *F = M->getFunction("probe");
+  ASSERT_NE(F, nullptr);
+  EJitStructFieldPass Pass(Registry);
+  Pass.initFromModule(*M);
+  runStructFieldOn(*F, Pass);
+  auto *Ret = dyn_cast<ReturnInst>(F->back().getTerminator());
+  ASSERT_NE(Ret, nullptr);
+  EXPECT_TRUE(isa<ConstantInt>(Ret->getReturnValue()));
+  EXPECT_EQ(countLoads(*F), 0u);
+}
+
+TEST(EJitStructFieldPass, AbsoluteAddressRejectsNonDefaultAddressSpace) {
+  uint64_t Data = 4096;
+  std::ostringstream IR;
+  IR << "@cfg = external global i64, !ejit.metadata !0\n"
+        "define i64 @probe() !ejit.metadata !3 {\n"
+        "entry:\n"
+        "  %v = load i64, ptr addrspace(1) inttoptr (i64 "
+     << reinterpret_cast<uintptr_t>(&Data)
+     << " to ptr addrspace(1)), align 8, !ejit.may_const !7\n"
+        "  ret i64 %v\n"
+        "}\n"
+        "!0 = !{!1, !2}\n"
+        "!1 = !{!\"ejit_period\", !\"static\"}\n"
+        "!2 = !{!\"ejit_may_const_field\", i64 0}\n"
+        "!3 = distinct !{!4}\n!4 = !{!\"ejit_entry\"}\n"
+        "!7 = !{}\n";
+
+  LLVMContext Ctx;
+  auto M = parseIR01TestModule(Ctx, IR.str());
+  ASSERT_NE(M, nullptr);
+  PeriodArrayRegistry Registry;
+  Registry.registerStaticVar("cfg", &Data);
+  Function *F = M->getFunction("probe");
+  ASSERT_NE(F, nullptr);
+  EJitStructFieldPass Pass(Registry);
+  Pass.initFromModule(*M);
+  runStructFieldOn(*F, Pass);
+  EXPECT_EQ(countLoads(*F), 1u)
+      << "non-default address-space load was treated as host address";
+}
+
+/// The final pointer is AS0, but it passed through AS1 between two otherwise
+/// valid inbounds/nuw GEP chains. The direct AS0 control must fold; the cast
+/// chain is conservatively rejected because its address-space semantics are
+/// not a host-pointer contract.
+TEST(EJitStructFieldPass, AbsoluteAddressRejectsIntermediateAddressSpaceCast) {
+  uint64_t Data = 4096;
+  std::ostringstream IR;
+  IR << "@cfg = external global i64, !ejit.metadata !0\n"
+        "define i64 @probe() !ejit.metadata !3 {\n"
+        "entry:\n"
+        "  %p_valid = getelementptr inbounds nuw i64, ptr inttoptr (i64 "
+     << reinterpret_cast<uintptr_t>(&Data)
+     << " to ptr), i64 0\n"
+        "  %valid = load i64, ptr %p_valid, align 8, !ejit.may_const !7\n"
+        "  %p_step = getelementptr inbounds nuw i64, ptr inttoptr (i64 "
+     << reinterpret_cast<uintptr_t>(&Data)
+     << " to ptr), i64 0\n"
+        "  %as1 = addrspacecast ptr %p_step to ptr addrspace(1)\n"
+        "  %as0 = addrspacecast ptr addrspace(1) %as1 to ptr\n"
+        "  %casted = load i64, ptr %as0, align 8, !ejit.may_const !7\n"
+        "  %sum = add i64 %valid, %casted\n"
+        "  ret i64 %sum\n"
+        "}\n"
+        "!0 = !{!1, !2}\n"
+        "!1 = !{!\"ejit_period\", !\"static\"}\n"
+        "!2 = !{!\"ejit_may_const_field\", i64 0}\n"
+        "!3 = distinct !{!4}\n!4 = !{!\"ejit_entry\"}\n"
+        "!7 = !{}\n";
+
+  LLVMContext Ctx;
+  auto M = parseIR01TestModule(Ctx, IR.str());
+  ASSERT_NE(M, nullptr);
+  PeriodArrayRegistry Registry;
+  Registry.registerStaticVar("cfg", &Data);
+  Function *F = M->getFunction("probe");
+  ASSERT_NE(F, nullptr);
+  EJitStructFieldPass Pass(Registry);
+  Pass.initFromModule(*M);
+  runStructFieldOn(*F, Pass);
+
+  LoadInst *Remaining = nullptr;
+  for (Instruction &I : instructions(*F))
+    if ((Remaining = dyn_cast<LoadInst>(&I)))
+      break;
+  ASSERT_NE(Remaining, nullptr);
+  EXPECT_EQ(Remaining->getPointerOperand()->getName(), "as0");
+  EXPECT_EQ(countLoads(*F), 1u)
+      << "intermediate address-space cast was treated as a host address";
+}
+
+/// The GEP carries both inbounds and nuw. At this witness the i64 index times
+/// the i64 stride is 2^64, so the address computation is not a valid wrapped
+/// pointer. The checked APInt walker must reject it before object lookup can
+/// accidentally turn it into an in-range address.
+TEST(EJitStructFieldPass, AbsoluteAddressRejectsGEPIndexStrideOverflow) {
+  uint64_t Data[2] = {4096, 8192};
+  const uint64_t HugeIndex = uint64_t{1} << 61;
+  std::ostringstream IR;
+  IR << "@cfg = external global [2 x i64], !ejit.metadata !0\n"
+        "define i64 @probe(i8 %cell) !ejit.metadata !3 {\n"
+        "entry:\n"
+        "  %p_valid = getelementptr inbounds nuw [2 x i64], ptr inttoptr (i64 "
+     << reinterpret_cast<uintptr_t>(Data) << " to ptr), i64 0, i64 0\n"
+        "  %valid = load i64, ptr %p_valid, align 8, !ejit.may_const !7\n"
+        "  %p_overflow = getelementptr inbounds nuw [2 x i64], ptr inttoptr (i64 "
+     << reinterpret_cast<uintptr_t>(Data) << " to ptr), i64 0, i64 "
+     << HugeIndex
+     << "\n"
+        "  %overflow = load i64, ptr %p_overflow, align 8, !ejit.may_const !7\n"
+        "  %sum = add i64 %valid, %overflow\n"
+        "  ret i64 %sum\n"
+        "}\n"
+        "!0 = !{!1, !2}\n"
+        "!1 = !{!\"ejit_period_arr\", !\"cell\", i32 2}\n"
+        "!2 = !{!\"ejit_may_const_field\", i64 0}\n"
+        "!3 = distinct !{!4, !5}\n!4 = !{!\"ejit_entry\"}\n"
+        "!5 = !{!\"ejit_period_arr_ind\", !\"cell\", i32 0}\n"
+        "!7 = !{}\n";
+
+  LLVMContext Ctx;
+  auto M = parseIR01TestModule(Ctx, IR.str());
+  ASSERT_NE(M, nullptr);
+  PeriodArrayRegistry Registry;
+  Registry.registerArray("cell", "cfg", Data, 2);
+  Function *F = M->getFunction("probe");
+  ASSERT_NE(F, nullptr);
+  EJitStructFieldPass Pass(Registry);
+  Pass.initFromModule(*M);
+  runStructFieldOn(*F, Pass);
+  EXPECT_EQ(countLoads(*F), 1u)
+      << "overflowing GEP index/stride was folded";
+  LoadInst *Remaining = nullptr;
+  for (Instruction &I : instructions(*F))
+    if ((Remaining = dyn_cast<LoadInst>(&I)))
+      break;
+  ASSERT_NE(Remaining, nullptr);
+  EXPECT_EQ(Remaining->getPointerOperand()->getName(), "p_overflow");
+}
+
+/// This is a genuine witness poison case on the absolute-address path:
+/// sub nuw i64 0, 1 is poison, even though its wrapped bit pattern could be
+/// made to look like a plausible in-range index by later masking.
+TEST(EJitStructFieldPass, AbsoluteAddressRejectsWitnessPoison) {
+  uint64_t Data[4] = {4096, 4096, 4096, 4096};
+  std::ostringstream IR;
+  IR << "@cfg = external global [4 x i64], !ejit.metadata !0\n"
+        "define i64 @probe(i8 %cell, i64 %slot) !ejit.metadata !3 {\n"
+        "entry:\n"
+        "  %bad = sub nuw i64 %slot, 1\n"
+        "  %wrapped = and i64 %bad, 3\n"
+        "  %p_bad = getelementptr inbounds nuw i64, ptr inttoptr (i64 "
+     << reinterpret_cast<uintptr_t>(Data) << " to ptr), i64 %wrapped\n"
+        "  %bad_value = load i64, ptr %p_bad, align 8, !ejit.may_const !7\n"
+        "  %good = sub i64 %slot, 1\n"
+        "  %good_wrapped = and i64 %good, 3\n"
+        "  %p_valid = getelementptr inbounds nuw i64, ptr inttoptr (i64 "
+     << reinterpret_cast<uintptr_t>(Data)
+     << " to ptr), i64 %good_wrapped\n"
+        "  %valid = load i64, ptr %p_valid, align 8, !ejit.may_const !7\n"
+        "  %sum = add i64 %bad_value, %valid\n"
+        "  ret i64 %sum\n"
+        "}\n"
+        "!0 = !{!1, !2}\n"
+        "!1 = !{!\"ejit_period_arr\", !\"cell\", i32 4}\n"
+        "!2 = !{!\"ejit_may_const_field\", i64 0}\n"
+        "!3 = distinct !{!4, !5, !6}\n"
+        "!4 = !{!\"ejit_entry\"}\n"
+        "!5 = !{!\"ejit_period_arr_ind\", !\"cell\", i32 0}\n"
+        "!6 = !{!\"ejit_free_dim\", !\"\", i32 1}\n"
+        "!7 = !{}\n";
+
+  LLVMContext Ctx;
+  auto M = parseIR01TestModule(Ctx, IR.str());
+  ASSERT_NE(M, nullptr);
+  PeriodArrayRegistry Registry;
+  Registry.registerArray("cell", "cfg", Data, 4);
+  Function *F = M->getFunction("probe");
+  ASSERT_NE(F, nullptr);
+  EJitStructFieldPass Pass(Registry);
+  Pass.initFromModule(*M);
+  runStructFieldOn(*F, Pass);
+  EXPECT_EQ(countLoads(*F), 1u)
+      << "witness poison was evaluated as a wrapped address";
+  LoadInst *Remaining = nullptr;
+  for (Instruction &I : instructions(*F))
+    if ((Remaining = dyn_cast<LoadInst>(&I)))
+      break;
+  ASSERT_NE(Remaining, nullptr);
+  EXPECT_EQ(Remaining->getPointerOperand()->getName(), "p_bad");
+}
+
+static void checkIR01GEPWitness(bool IntermediateInbounds, bool Flagged) {
+  uint64_t Data[3] = {Flagged ? 11u : 42u, 42u, 42u};
+  const uintptr_t Base = reinterpret_cast<uintptr_t>(Data);
+  std::ostringstream IR;
+  IR << "@cfg = external global [3 x i64], !ejit.metadata !0\n"
+        "define i64 @probe(i8 %cell, i64 %slot) !ejit.metadata !3 {\n"
+        "entry:\n"
+        "  %index = sub i64 %slot, 1\n"
+        "  %step = getelementptr ";
+  if (Flagged)
+    IR << (IntermediateInbounds ? "inbounds " : "nuw ");
+  IR << "i64, ptr inttoptr (i64 "
+     << (IntermediateInbounds ? Base : Base + sizeof(uint64_t))
+     << " to ptr), i64 %index\n";
+  if (IntermediateInbounds)
+    IR << "  %last = getelementptr i64, ptr %step, i64 1\n";
+  IR << "  %word = load i64, ptr %"
+     << (IntermediateInbounds ? "last" : "step")
+     << ", align 8, !ejit.may_const !7\n"
+        "  ret i64 %word\n"
+        "}\n"
+        "!0 = !{!1, !2}\n"
+        "!1 = !{!\"ejit_period_arr\", !\"cell\", i32 3}\n"
+        "!2 = !{!\"ejit_may_const_field\", i64 0}\n"
+        "!3 = distinct !{!4, !5, !6}\n"
+        "!4 = !{!\"ejit_entry\"}\n"
+        "!5 = !{!\"ejit_period_arr_ind\", !\"cell\", i32 0}\n"
+        "!6 = !{!\"ejit_free_dim\", !\"\", i32 1}\n"
+        "!7 = !{}\n";
+
+  LLVMContext Ctx;
+  auto M = parseIR01TestModule(Ctx, IR.str());
+  ASSERT_NE(M, nullptr);
+  PeriodArrayRegistry Registry;
+  Registry.registerArray("cell", "cfg", Data, 3);
+  Function *F = M->getFunction("probe");
+  ASSERT_NE(F, nullptr);
+  EJitStructFieldPass Pass(Registry);
+  Pass.initFromModule(*M);
+  runStructFieldOn(*F, Pass);
+
+  auto *Ret = dyn_cast<ReturnInst>(F->back().getTerminator());
+  ASSERT_NE(Ret, nullptr);
+  if (Flagged) {
+    // Slots 1 and 2 are defined and both read 42. The witness at slot 0 is
+    // poison for the flagged GEP, so inventing Data[0] would be unsound.
+    EXPECT_EQ(countLoads(*F), 1u);
+    EXPECT_TRUE(isa<LoadInst>(Ret->getReturnValue()));
+  } else {
+    EXPECT_EQ(countLoads(*F), 0u);
+    auto *Value = dyn_cast<ConstantInt>(Ret->getReturnValue());
+    ASSERT_NE(Value, nullptr);
+    EXPECT_EQ(Value->getZExtValue(), 42u);
+  }
+}
+
+TEST(EJitStructFieldPass, AbsoluteAddressRejectsGEPNUWNegativeWitness) {
+  checkIR01GEPWitness(false, true);
+}
+
+TEST(EJitStructFieldPass, AbsoluteAddressFoldsGEPUnflaggedNegativeControl) {
+  checkIR01GEPWitness(false, false);
+}
+
+TEST(EJitStructFieldPass,
+     AbsoluteAddressRejectsGEPIntermediateInboundsWitness) {
+  checkIR01GEPWitness(true, true);
+}
+
+TEST(EJitStructFieldPass,
+     AbsoluteAddressFoldsGEPUnflaggedIntermediateControl) {
+  checkIR01GEPWitness(true, false);
+}
+
+TEST(EJitStructFieldPass, AbsoluteAddressDirectI8StaticFoldsNoFreeDim) {
+  uint8_t Data = 7;
+  std::ostringstream IR;
+  IR << "@cfg = external global i8, !ejit.metadata !0\n"
+        "define i8 @probe() !ejit.metadata !3 {\n"
+        "entry:\n"
+        "  %value = load i8, ptr inttoptr (i64 "
+     << reinterpret_cast<uintptr_t>(&Data)
+     << " to ptr), align 1, !ejit.may_const !7\n"
+        "  %is_expected = icmp eq i8 %value, 7\n"
+        "  br i1 %is_expected, label %yes, label %no\n"
+        "yes:\n"
+        "  ret i8 1\n"
+        "no:\n"
+        "  ret i8 0\n"
+        "}\n"
+        "!0 = !{!1, !2}\n"
+        "!1 = !{!\"ejit_period\", !\"static\"}\n"
+        "!2 = !{!\"ejit_may_const_field\", i64 0}\n"
+        "!3 = distinct !{!4}\n"
+        "!4 = !{!\"ejit_entry\"}\n"
+        "!7 = !{}\n";
+
+  LLVMContext Ctx;
+  auto M = parseIR01TestModule(Ctx, IR.str());
+  ASSERT_NE(M, nullptr);
+  PeriodArrayRegistry Registry;
+  Registry.registerStaticVar("cfg", &Data);
+  Function *F = M->getFunction("probe");
+  ASSERT_NE(F, nullptr);
+  EJitStructFieldPass Pass(Registry);
+  Pass.initFromModule(*M);
+  ASSERT_TRUE(runStructFieldOn(*F, Pass));
+  foldIR01Constants(*F, *M);
+
+  auto *Ret = dyn_cast<ReturnInst>(F->back().getTerminator());
+  ASSERT_NE(Ret, nullptr);
+  auto *Value = dyn_cast<ConstantInt>(Ret->getReturnValue());
+  ASSERT_NE(Value, nullptr);
+  EXPECT_EQ(Value->getZExtValue(), 1u);
+  EXPECT_EQ(countLoads(*F), 0u);
+  unsigned ConditionalBranches = 0;
+  for (Instruction &I : instructions(*F))
+    if (auto *BI = dyn_cast<BranchInst>(&I))
+      ConditionalBranches += BI->isConditional();
+  EXPECT_EQ(ConditionalBranches, 0u);
+}
+
+struct IR01BRecord {
+  uint8_t Prefix;
+  uint8_t Frozen;
+  uint8_t Live;
+  uint8_t BoolByte;
+};
+static_assert(offsetof(IR01BRecord, Frozen) != 0 &&
+              offsetof(IR01BRecord, BoolByte) != 0);
+
+TEST(EJitStructFieldPass,
+     AbsoluteAddressDirectI8AndBoolFieldsPreserveAdjacentLive) {
+  IR01BRecord Data = {13, 42, 99, 1};
+  const uint64_t FrozenOffset = offsetof(IR01BRecord, Frozen);
+  const uint64_t LiveOffset = offsetof(IR01BRecord, Live);
+  const uint64_t BoolOffset = offsetof(IR01BRecord, BoolByte);
+  std::ostringstream IR;
+  IR << "@cfg = external global { i8, i8, i8, i8 }, !ejit.metadata !0\n"
+        "declare void @sink(i8)\n"
+        "define i8 @probe() !ejit.metadata !4 {\n"
+        "entry:\n"
+        "  %frozen = load i8, ptr inttoptr (i64 "
+     << reinterpret_cast<uintptr_t>(&Data.Frozen)
+     << " to ptr), align 1, !ejit.may_const !7\n"
+        "  %bool_byte = load i8, ptr inttoptr (i64 "
+     << reinterpret_cast<uintptr_t>(&Data.BoolByte)
+     << " to ptr), align 1, !ejit.may_const !8, !range !9\n"
+        "  %bool = trunc i8 %bool_byte to i1\n"
+        "  %live = load i8, ptr inttoptr (i64 "
+     << reinterpret_cast<uintptr_t>(&Data.Live)
+     << " to ptr), align 1\n"
+        "  br i1 %bool, label %yes, label %no\n"
+        "yes:\n"
+        "  call void @sink(i8 %live)\n"
+        "  ret i8 %frozen\n"
+        "no:\n"
+        "  call void @sink(i8 %live)\n"
+        "  ret i8 0\n"
+        "}\n"
+        "!0 = !{!1, !2, !3}\n"
+        "!1 = !{!\"ejit_period\", !\"static\"}\n"
+        "!2 = !{!\"ejit_may_const_field\", i64 "
+     << FrozenOffset << "}\n"
+        "!3 = !{!\"ejit_may_const_field\", i64 "
+     << BoolOffset << "}\n"
+        "!4 = distinct !{!5}\n"
+        "!5 = !{!\"ejit_entry\"}\n"
+        "!7 = !{}\n"
+        "!8 = !{}\n"
+        "!9 = !{i8 0, i8 2}\n";
+
+  LLVMContext Ctx;
+  auto M = parseIR01TestModule(Ctx, IR.str());
+  ASSERT_NE(M, nullptr);
+  PeriodArrayRegistry Registry;
+  Registry.registerStaticVar("cfg", &Data);
+  Function *F = M->getFunction("probe");
+  ASSERT_NE(F, nullptr);
+  EJitStructFieldPass Pass(Registry);
+  Pass.initFromModule(*M);
+  ASSERT_TRUE(runStructFieldOn(*F, Pass));
+  foldIR01Constants(*F, *M);
+
+  auto *Ret = dyn_cast<ReturnInst>(F->back().getTerminator());
+  ASSERT_NE(Ret, nullptr);
+  auto *Value = dyn_cast<ConstantInt>(Ret->getReturnValue());
+  ASSERT_NE(Value, nullptr);
+  EXPECT_EQ(Value->getZExtValue(), 42u);
+
+  LoadInst *Remaining = nullptr;
+  for (Instruction &I : instructions(*F))
+    if ((Remaining = dyn_cast<LoadInst>(&I)))
+      break;
+  ASSERT_NE(Remaining, nullptr);
+  EXPECT_EQ(Remaining->getName(), "live");
+  EXPECT_EQ(LiveOffset, 2u);
+}
+
+enum class IR01BControl { NoRegistration, MissingField, MissingLifecycle };
+
+static void expectIR01BControl(IR01BControl Case) {
+  uint8_t Data = 7;
+  std::ostringstream IR;
+  IR << "@cfg = external global i8, !ejit.metadata !0\n"
+        "define i8 @probe() !ejit.metadata !3 {\n"
+        "entry:\n"
+        "  %value = load i8, ptr inttoptr (i64 "
+     << reinterpret_cast<uintptr_t>(&Data)
+     << " to ptr), align 1, !ejit.may_const !7\n"
+        "  ret i8 %value\n"
+        "}\n"
+        "!0 = !{!1, !2}\n"
+        "!1 = !{!\"ejit_period\", !\"static\"}\n";
+  if (Case == IR01BControl::MissingField)
+    IR << "!2 = !{}\n";
+  else
+    IR << "!2 = !{!\"ejit_may_const_field\", i64 0}\n";
+  if (Case == IR01BControl::MissingLifecycle)
+    IR << "!3 = distinct !{}\n";
+  else
+    IR << "!3 = distinct !{!4}\n!4 = !{!\"ejit_entry\"}\n";
+  IR << "!7 = !{}\n";
+
+  LLVMContext Ctx;
+  auto M = parseIR01TestModule(Ctx, IR.str());
+  ASSERT_NE(M, nullptr);
+  PeriodArrayRegistry Registry;
+  if (Case != IR01BControl::NoRegistration)
+    Registry.registerStaticVar("cfg", &Data);
+  Function *F = M->getFunction("probe");
+  ASSERT_NE(F, nullptr);
+  EJitStructFieldPass Pass(Registry);
+  Pass.initFromModule(*M);
+  runStructFieldOn(*F, Pass);
+  EXPECT_EQ(countLoads(*F), 1u);
+}
+
+TEST(EJitStructFieldPass,
+     AbsoluteAddressBClassRejectsMissingRegistrationOrContracts) {
+  for (IR01BControl Case : {IR01BControl::NoRegistration,
+                            IR01BControl::MissingField,
+                            IR01BControl::MissingLifecycle}) {
+    SCOPED_TRACE(static_cast<int>(Case));
+    expectIR01BControl(Case);
+  }
 }
