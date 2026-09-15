@@ -5944,6 +5944,53 @@ TEST(EJitStructFieldPass, AbsoluteAddressDirectI8StaticFoldsNoFreeDim) {
   EXPECT_EQ(ConditionalBranches, 0u);
 }
 
+/// Exercise the non-pointer period-array registration branch with the same
+/// direct i8/inttoptr shape as the static B-class regression above.
+TEST(EJitStructFieldPass,
+     AbsoluteAddressDirectI8PeriodArrayFoldsNoFreeDim) {
+  uint8_t Data[4] = {7, 7, 7, 7};
+  std::ostringstream IR;
+  IR << "@cfg = external global [4 x i8], !ejit.metadata !0\n"
+        "define i8 @probe(i8 %cell) !ejit.metadata !3 {\n"
+        "entry:\n"
+        "  %value = load i8, ptr inttoptr (i64 "
+     << reinterpret_cast<uintptr_t>(Data)
+     << " to ptr), align 1, !ejit.may_const !7\n"
+        "  %is_expected = icmp eq i8 %value, 7\n"
+        "  br i1 %is_expected, label %yes, label %no\n"
+        "yes:\n"
+        "  ret i8 1\n"
+        "no:\n"
+        "  ret i8 0\n"
+        "}\n"
+        "!0 = !{!1, !2}\n"
+        "!1 = !{!\"ejit_period_arr\", !\"cell\", i32 4}\n"
+        "!2 = !{!\"ejit_may_const_field\", i64 0}\n"
+        "!3 = distinct !{!4, !5}\n"
+        "!4 = !{!\"ejit_entry\"}\n"
+        "!5 = !{!\"ejit_period_arr_ind\", !\"cell\", i32 0}\n"
+        "!7 = !{}\n";
+
+  LLVMContext Ctx;
+  auto M = parseIR01TestModule(Ctx, IR.str());
+  ASSERT_NE(M, nullptr);
+  PeriodArrayRegistry Registry;
+  Registry.registerArray("cell", "cfg", Data, 4);
+  Function *F = M->getFunction("probe");
+  ASSERT_NE(F, nullptr);
+  EJitStructFieldPass Pass(Registry);
+  Pass.initFromModule(*M);
+  ASSERT_TRUE(runStructFieldOn(*F, Pass));
+  foldIR01Constants(*F, *M);
+
+  auto *Ret = dyn_cast<ReturnInst>(F->back().getTerminator());
+  ASSERT_NE(Ret, nullptr);
+  auto *Value = dyn_cast<ConstantInt>(Ret->getReturnValue());
+  ASSERT_NE(Value, nullptr);
+  EXPECT_EQ(Value->getZExtValue(), 1u);
+  EXPECT_EQ(countLoads(*F), 0u);
+}
+
 struct IR01BRecord {
   uint8_t Prefix;
   uint8_t Frozen;
