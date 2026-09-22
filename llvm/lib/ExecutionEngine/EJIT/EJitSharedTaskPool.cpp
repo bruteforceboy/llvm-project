@@ -358,14 +358,26 @@ void llvm::ejit::ejitDumpIcacheSlots(const EJitModuleLoader *loader) {
     EJitIcacheSlotReg &reg = gIcacheSlots[f];
     if (!reg.base)
       continue;
+    if (reg.numDims > EJIT_ICACHE_MAX_DIMS)
+      continue; // defence in depth: never walk past a mis-sized array
     registered++;
-    // For multi-dim arrays, cell[0] is the [0]...[0] element; for 0-dim,
-    // it is the scalar cell. Either way it tells us whether the first
-    // identity has been resolved yet. A sentinel-form table's empty value is
-    // &MissFn, so "filled" must exclude it explicitly.
+    // A sentinel-form table's empty value is &MissFn, so "filled" must exclude
+    // it explicitly.
     const uintptr_t empty = reinterpret_cast<uintptr_t>(reg.missFn);
-    const uintptr_t c0 = icacheCell(reg.base, 0).loadRelaxed();
-    if (c0 != 0 && c0 != empty)
+    // cell[0] is the [0]...[0] identity (or the scalar cell for 0-dim). It is
+    // NOT representative: an application that only ever uses instance id 1
+    // leaves cell[0] at its empty value forever, so the old cell[0]-only check
+    // reported "nothing filled" while the identities in use were populated.
+    // Walk every cell instead (at most EJIT_ICACHE_DIM_SIZE^4 per slot; this
+    // is a diagnostic path).
+    uintptr_t occupied = 0;
+    for (uintptr_t i = 0, cells = icacheCellCount(reg.numDims); i < cells;
+         ++i) {
+      const uintptr_t c = icacheCell(reg.base, i).loadRelaxed();
+      if (c != 0 && c != empty)
+        ++occupied;
+    }
+    if (occupied != 0)
       filled++;
     // The slot index IS the funcIndex (a static_assert above guarantees
     // EJIT_ICACHE_FUNC_SLOTS >= EJIT_SRE_TASKPOOL_MAX_FUNC_INDEX), so a
@@ -378,14 +390,21 @@ void llvm::ejit::ejitDumpIcacheSlots(const EJitModuleLoader *loader) {
       name = s.empty() ? "<unknown>" : s.c_str();
     }
     (void)name; // consumed by EJIT_DIAG_RAW only; silence DIAG-off builds
-    const char *state =
-        c0 == 0 ? "(empty)" : c0 == empty ? "(sentinel)" : "(filled)";
-    EJIT_DIAG_RAW("  [%2u] %.24s base=%p numDims=%u cells=%u cell[0]=%p %s",
+    const uintptr_t c0 = icacheCell(reg.base, 0).loadRelaxed();
+    // The state describes the WHOLE table: any filled cell wins; only when
+    // nothing is filled does the empty form matter, and cell[0] tells which
+    // one it is (0 = guarded, &MissFn = sentinel).
+    const char *state = occupied != 0 ? "(filled)"
+                        : c0 == 0    ? "(empty)"
+                                     : "(sentinel)";
+    EJIT_DIAG_RAW("  [%2u] %.24s base=%p numDims=%u cells=%llu filled=%llu "
+                  "cell[0]=%p %s",
                   f, name, (void *)reg.base, reg.numDims,
-                  (unsigned)icacheCellCount(reg.numDims), (void *)c0, state);
+                  (unsigned long long)icacheCellCount(reg.numDims),
+                  (unsigned long long)occupied, (void *)c0, state);
     ejitDiagPrintThrottle();
   }
-  EJIT_DIAG_RAW("=== icache slots: %u registered, %u with cell[0] filled ===",
+  EJIT_DIAG_RAW("=== icache slots: %u registered, %u with any cell filled ===",
                 registered, filled);
   // Both counters are consumed by the RAW macro above only; silence
   // DIAG-off builds (same for `name` inside the loop).
