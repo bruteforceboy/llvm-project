@@ -222,23 +222,23 @@ stays live. This is why `preReplacePeriodIndices`'s whole-parameter RAUW
 `non-const-offset`. For each one whose address depends on the runtime dim, walk
 the variable part of the address back to the parameter. `P` is the common value
 on every one of those walks, and its only non-constant leaf is the parameter.
-v1 recognizes exactly these forms:
+v1 recognizes the modulus, the form real entries use:
 
 | Form | `P` | `M` | Path |
 |---|---|---|---|
 | `urem v, C`, with `C` constant after cell specialization | `v % C` | `C` | eager if within limits, else lazy |
-| `and v, 2ⁿ − 1` | `v & mask` | `2ⁿ` | eager if within limits, else lazy |
 | anything else | `v` (identity) | unbounded | lazy |
 
-In these forms, `v` is the parameter or a `zext` of it, and the operation is
-unsigned. `srem` and `sdiv`, which can produce negative keys, and any `trunc` or
-`sext` on the path, fall to the identity row.
+In the modulus form, `v` is the parameter or a `zext` of it, and the operation is
+unsigned. `srem` and `sdiv`, which can produce negative keys, any `trunc` or
+`sext` on the path, and other projections such as a mask, fall to the identity
+row (§10).
 
 **The projection descriptor** is `{op:8, width:8, pad:16, constant:32}`, 64 bits,
 compared field by field, never by hash. It is lossless because of one
-normalization: the parameter is at most 32 bits wide, so a `urem` or `and` whose
-constant is `2³²` or more cannot change its value, and is recorded as the
-identity. `% 3` and `% 5` therefore always differ.
+normalization: the parameter is at most 32 bits wide, so a `urem` whose constant
+is `2³²` or more cannot change its value, and is recorded as the identity. `% 3`
+and `% 5` therefore always differ.
 
 The identity row is always valid, because fixing the parameter fixes everything
 derived from it, and an identity-keyed arm is only entered for that exact value.
@@ -730,7 +730,7 @@ should not use the attribute.
 |---|---|---|
 | 0 | `EJIT_SWITCH_CASE` and limit options; attribute in `Attr.td`, Sema rules and CodeGen tag (§3) | OFF: byte-identical `ejit.o`, attribute warns and is ignored. ON: unchanged output for entries without it. Sema tests for every rule in §3 |
 | 1 | The §1.1 integration test and a constant-table variant, run with today's code, inline cache on | Baselines for §8.2; gate values `G_*` and budget defaults fixed |
-| 2 | **Transformation prototype**: projection detection, supported-form checks, key selection, region cloning, eager path, compile-time logs (§4, §5.1–§5.2, §7). Unbudgeted; not for deployment | `slotNo = 5` reaches arm 2 and returns `r + 5`; part A appears once; each §4.1 form, including `srem` falling to identity; descriptors distinguish `% 3` from `% 5`; config-field modulus; address chain above the switch point rematerialized; key-dependent load behind a condition in a loop (hoisted, still correct on zero-trip); helper-only sites declined; a key resolving no site is never cloned; a fully covered finite domain loses its default region correctly; bound-pointer entry gets eager arms; every §4.2 decline logged |
+| 2 | **Transformation prototype**: projection detection, supported-form checks, key selection, region cloning, eager path, compile-time logs (§4, §5.1–§5.2, §7). Unbudgeted; not for deployment | `slotNo = 5` reaches arm 2 and returns `r + 5`; part A appears once; each §4.1 form, including `srem` and a mask falling to identity; descriptors distinguish `% 3` from `% 5`; config-field modulus; address chain above the switch point rematerialized; key-dependent load behind a condition in a loop (hoisted, still correct on zero-trip); helper-only sites declined; a key resolving no site is never cloned; a fully covered finite domain loses its default region correctly; bound-pointer entry gets eager arms; every §4.2 decline logged |
 | 3 | Admission in `allocate`, feature budget, per-identity caps (§5.3). **The eager path is complete here** | Admission happens before `Pool.allocateCode`, and the admitted allocation is the one charged; an allocation larger than the remaining budget is refused; seal waste is included; a refused initial compile recompiles uncharged; charges survive every later failure; arrival order across identities is logged and tested |
 | 4 | Region-size sweep; dispatch lowering comparison (§4.4, §8.2) | Limits set; lowering chosen |
 | 5 | Lazy path: record pool, sampling, verification, epoch, state machine (§6.2–§6.4) | gtest: concurrent observers on one record, including a 0-dim entry, lose no correctness; a caller entering after a freeze does not reopen collection; a paused caller cannot move `calls` backwards, under heavy traffic or across a reset; old-epoch samples are rejected after a reset, a generation change and a reassignment; every §6.4 transition; repeated rejected promotions stop at the budget; periodic, bursty and phase-changing traffic freeze the dominant keys, not an aliased one |
@@ -779,6 +779,9 @@ treating it as today, inside every arm.
 * **Adapting frozen keys** when the dominant keys shift after promotion. Like
   extra batches, any re-selection draws on the feature budget, because each one
   leaves unreclaimable code behind.
+* **More projection forms**, such as a mask (`v & (2ⁿ − 1)`, `M = 2ⁿ`), if real
+  entries start using them. Until then they fall to the identity row: correct,
+  but lazy-only.
 * Online PGO support; the lazy path for bound-pointer entries; more than one
   runtime dim per entry; sites in non-inlined helpers.
 
@@ -807,8 +810,8 @@ The checklist for review and tests; each rule is stated where it arises.
 
 ## 12. Open questions
 
-1. **Real key behaviour.** Is `P` usually a modulus or mask, by a constant or a
-   configuration field? How are the keys distributed per cell per TTI? This
+1. **Real key behaviour.** `P` is usually a modulus. Is its divisor a constant or
+   a configuration field, and how are the keys distributed per cell per TTI? This
    decides how often the eager path applies, and sets `S`, `W`, `C` and `R`.
 2. **Record pool size per entry.** Up to 255 records of about 256 bytes. How many
    lazy identities does one real entry have?
