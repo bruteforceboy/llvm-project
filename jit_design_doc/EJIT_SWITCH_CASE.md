@@ -361,6 +361,10 @@ At every compile of an identity, after §4.1–§4.2:
 The choice is remade at every compile, so a configuration update that changes
 `P` (a new `numSlots`) simply moves the identity to whichever path now applies.
 
+**A cell specialization has one set of arms**, at most `A_max`. Keys without an
+arm take the default arm; there is no second batch. A re-promotion replaces the
+set rather than adding to it.
+
 ### 5.2 Eager path
 
 The first compile builds all `M` arms. There is no observation, no record, no
@@ -645,10 +649,9 @@ where correctness is decided.
 
 **Excluded in v1:**
 * **Online PGO.** Tier-1 and Tier-2 must number sites on the same CFG. Arms
-  change the CFG, so a switch-case entry stays at baseline;
+  change the CFG, so a switch-case entry stays at baseline.
 * **`ejit_bound_ptr` entries.** The promotion request is raised from JIT code,
-  which has no bound-pointer descriptor to attach;
-* sync mode, for the lazy path only (§5.1).
+  which has no bound-pointer descriptor to attach.
 
 `ejit_free_dim` is independent: it is a different parameter, and PASS6 keeps
 treating it as today, inside every arm.
@@ -665,9 +668,14 @@ treating it as today, inside every arm.
   runtime-library size. It also turns shared hot-path sequences into calls, and it
   only guarantees a size win. Consider it only if stage 7 shows significant
   duplication, measuring cycles as well as bytes.
-* **Adapting frozen keys** when the dominant keys shift after promotion. Any
-  re-selection needs its own lifetime allocation budget, because each one leaves
-  unreclaimable code behind.
+* **More than one batch of arms per cell.** Today, keys that do not fit in the
+  `A_max` arms fall to the default arm. A later version could compile further
+  batches of arms for those keys, so more of them get specialized code. Each
+  batch costs a recompile and pool space that is never freed, so this should be
+  driven by the measured coverage (§8.2).
+* **Adapting frozen keys** when the dominant keys shift after promotion. Like
+  extra batches, any re-selection needs its own lifetime allocation budget,
+  because each one leaves unreclaimable code behind.
 * Online PGO and `ejit_bound_ptr` support; more than one runtime dim per entry;
   sites in non-inlined helpers.
 
