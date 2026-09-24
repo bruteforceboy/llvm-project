@@ -1,13 +1,15 @@
 # EJIT Switch-Case Mode — runtime-keyed arms inside a per-identity specialization
 
 **Status**: design, not implemented
-**Related**: `EJIT_FREE_DIM.md`, `EJIT_VALUE_PROFILE.md`, `EJIT_ONLINE_PGO.md`,
-`EJIT_ICACHE_MULTIVERSION.md`, `PASS3_EJitWrapperGen.md`,
-`PASS6_EJitStructFieldPass.md`
+**Related**: `EJIT_FREE_DIM.md`, `EJIT_ICACHE_MULTIVERSION.md`,
+`EJIT_ICACHE_SHARED_TABLE.md`, `EJIT_VALUE_PROFILE.md`, `EJIT_ONLINE_PGO.md`,
+`PASS3_EJitWrapperGen.md`, `PASS6_EJitStructFieldPass.md`
 
 ---
 
-## 1. Problem
+## 1. Goal and scope
+
+### 1.1 Problem
 
 Some entries select their `may_const` data with a value that is only known at
 runtime and that EJIT cannot fold today. The running example uses a cell index
@@ -62,13 +64,14 @@ None of the existing parameter attributes fits `slotNo`:
 | `ejit_dim` | No period array describes the slot, so there is no declared range; values run up to about 1024, against `kEJitSharedInstances = 256` (`EJitSharedTaskPoolState.h:109`); and the slot has no activate/deactivate lifecycle of its own. The data it selects belongs to the cell's period. |
 | `ejit_free_dim` | Its contract is that the data is the same for every value (`EJIT_FREE_DIM.md` §2). Here it is not. |
 
-**Switch-case mode** keeps the per-identity model exactly as it is (one
-specialization per `cellIndex`) and adds, *inside* each specialization, a small
-number of **arms** keyed on the runtime value, plus a **default arm**. Only the
-code that needs the key is cloned (§4.2).
+### 1.2 Objective
 
-Take cell 3 with `len = 4`, `coef = {1, -2, 3, 1}`, `clip = 1000`, and
-`slot[0..2] = {2,3,1}, {0,1,0}, {4,5,1}`. Its promoted specialization is:
+**Fold slot-dependent data inside each cell's specialization, without a full
+specialization per slot.** Each cell keeps one specialization, exactly as today.
+Inside it, a small number of **arms** are keyed on the slot, plus a **default
+arm**, and only the code that needs the key is cloned (§4). Cell 3 with
+`len = 4`, `coef = {1, -2, 3, 1}`, `clip = 1000`, and
+`slot[0..2] = {2,3,1}, {0,1,0}, {4,5,1}` becomes:
 
 ```c
 int32_t process_cell3(uint8_t, uint32_t slotNo, const int16_t *in) {
@@ -90,27 +93,45 @@ int32_t process_cell3(uint8_t, uint32_t slotNo, const int16_t *in) {
 }
 ```
 
-An identity has at most `min(M, A_max)` arms (§2), **never** the product of the
-cell range and the slot range.
+The gain is speed, bought with bounded extra code. Whether arms cost or save
+memory depends on the baseline, so all three are measured (§8):
 
-### 1.1 What does not change
+| Baseline | Arms against it |
+|---|---|
+| **Today**: one specialization per cell, slot generic | **More code.** Must be faster to justify it |
+| One full specialization per `(cell, slot)` pair | **Much less code.** Not available today for `slotNo`, but it is what arms replace where it would be |
+| One specialization per cell, with the slot's data copied into a small constant table in the JIT code, indexed by the key | **Usually more code.** The table cannot fold branches such as `if (s->mode)`; arms must beat it on speed |
+
+**Two kinds of slot churn behave differently:**
+* **selection churn**: calls pick slot 0, then 2, then 1. This only selects a
+  different arm; nothing is compiled. The design is cheap here;
+* **configuration churn**: a period handler rewrites a slot's data. That
+  invalidates the whole cell specialization, and every arm is recompiled with it
+  (§8.1).
+
+### 1.3 What does not change
 
 The runtime dim never enters the specialization identity. So the following are
-all unchanged, and switch-case adds nothing to them:
+all unchanged:
 
 * the cache identity `(funcIndex, dims[])`, `EJitCompileRequest`, dedup;
-* the inline cache: the `[D]^numDims` cell table stays keyed on the `ejit_dim`s;
 * versions, publication, the generation gate;
 * **deactivation.** PASS4's deactivate → modify → reactivate cycle
   (`EJitPeriodHandler.cpp`) is today's. A specialization, arms included, is one
   function, so it is invalidated and rebuilt as a whole. The runtime dim has no
-  lifecycle and is never deactivated.
+  lifecycle and is never deactivated;
+* **the inline cache** (`-mllvm -ejit-inline-cache`), which the design assumes
+  is on, as on the board. The `[D]^numDims` cell table stays keyed on the
+  `ejit_dim`s. A hit tail-calls the specialization with the original arguments,
+  so the runtime dim arrives as an ordinary argument, and `EJIT_ICACHE_DIM_SIZE`
+  does not bound it. The only new interaction is on the lazy path: a promotion
+  must invalidate one cell (§6.6).
 
-The default arm is the specialization an entry gets today. So every arm is an
-addition on top of current behaviour, and **no state of this design runs code
-less specialized than today's** (§5.1).
+The default arm is the specialization an entry gets today. Arms are an addition
+on top of it, and **no state of this design runs code less specialized than
+today's**.
 
-### 1.2 Gating
+### 1.4 Gating
 
 A CMake option `EJIT_SWITCH_CASE` builds the support.
 
@@ -131,17 +152,18 @@ There is no separate AOT flag. The attribute is the per-entry opt-in.
 | **projection `P`** | the function of the runtime dim through which the `may_const` addresses depend on it (§4.1) |
 | **key** | `P(runtime dim)`; the value an arm is specialized for |
 | **`M`** | the number of distinct keys `P` can produce; unbounded for the identity projection |
-| **`A_max`** | the maximum number of arms in one specialization (§3) |
-| **switch point** | where the key is computed and dispatched on; code before it is shared by all arms (§4.2) |
+| **switch point** | where the key is computed and dispatched on; code before it is shared by all arms (§4.3) |
 | **arm** | a clone of the code after the switch point, with `P` replaced by one key |
 | **default arm** | the original code after the switch point, with the runtime dim left generic; today's code |
-| **key set** | the keys observed for one identity, at most `A_max` (§5) |
-| **promotion** | the single recompile of an identity that adds arms for its key set (§5.4) |
+| **eager path** | all `M` arms built in the first compile (§5.2) |
+| **lazy path** | arms chosen from observed keys, then added by one promotion (§6) |
+| **promotion** | the recompile of an identity that adds the lazy path's arms |
+| **epoch** | the lifecycle stamp of a lazy-path collection (§6.3) |
 | **identity** | `(funcIndex, dims[])`, unchanged from today |
 
 ---
 
-## 3. The attribute
+## 3. The attribute and its limits
 
 The spelling is a placeholder:
 
@@ -159,13 +181,6 @@ function. There may be at most one per function in v1. It cannot share a
 parameter with `ejit_dim`, `ejit_free_dim` or `ejit_bound_ptr`. A 0-dim entry
 may carry it too; its single identity then gets the arms.
 
-**`A_max`** caps the arms per specialization:
-* the default comes from a CMake option `EJIT_SWITCH_CASE_MAX_ARMS`, default 8.
-  It is passed to both PASS3 and the runtime, because PASS3 sizes the
-  per-identity record at AOT time (§5.2);
-* `ejit_runtime_dim(n)` overrides it for one entry, and PASS3 sizes that entry's
-  record from `n`.
-
 **Asserts nothing.** Unlike `ejit_free_dim`, soundness does not depend on a
 claim the programmer makes about the data. Every arm is guarded by its key, and
 any other value runs the default arm. The attribute is an opt-in to spending code
@@ -175,6 +190,21 @@ size on this parameter.
 `ejit_free_dim` emits `TAG_EJIT_FREE_DIM` (`CGEJIT.cpp:121`,
 `EJitCommon.h:72`). No range, modulus or period name is declared; the JIT
 derives them (§4.1).
+
+**Limits.** Arm count alone is not a cost bound: eight tiny arms and eight
+cloned loops differ by orders of magnitude. So v1 has four limits, as CMake
+options passed to both PASS3 and the runtime:
+
+| Option | Bounds | Default |
+|---|---|---|
+| `EJIT_SWITCH_CASE_MAX_ARMS` (`A_max`) | arms per specialization; overridable per entry with `ejit_runtime_dim(n)` | 8 |
+| `EJIT_SWITCH_CASE_MAX_REGION` | IR instructions in one arm's region; above it the entry gets no arms | set from the stage 3 sweep (§8.2) |
+| `EJIT_SWITCH_CASE_MAX_CLONED` | IR instructions added by cloning, summed over all arms of one compile; bounds compile work | set from the stage 3 sweep |
+| `EJIT_SWITCH_CASE_MAX_PROMOTIONS` | promotions per identity per generation (§6.4) | 2 |
+
+A fifth check, the **pool check**, is not an option. Before the worker links a
+specialization with arms, it compares the object's size with the pool's free
+space. If there is not enough, it compiles without arms instead (§6.4).
 
 ---
 
@@ -192,64 +222,79 @@ stays live. This is why `preReplacePeriodIndices`'s whole-parameter RAUW
 **Detection.** Consider the `may_const` sites the first PASS6 run declined with
 `non-const-offset`. For each one whose address depends on the runtime dim, walk
 the variable part of the address back to the parameter. `P` is the common value
-on every one of those walks, and its only non-constant leaf is the parameter:
+on every one of those walks, and its only non-constant leaf is the parameter.
+v1 recognizes exactly these forms:
 
-| The runtime dim reaches the `may_const` addresses via | `P` | `M` | Arms |
+| Form | `P` | `M` | Path |
 |---|---|---|---|
-| `v % C`, `C` constant after cell specialization | `v % C` | `C` | `min(C, A_max)` |
-| `v & (2ⁿ − 1)` | `v & mask` | `2ⁿ` | `min(2ⁿ, A_max)` |
-| anything else: raw `v`, a modulus that stays non-constant, different projections at different sites | `v` | unbounded | `A_max` |
+| `urem v, C`, with `C` constant after cell specialization | `v % C` | `C` | eager if within limits, else lazy |
+| `and v, 2ⁿ − 1` | `v & mask` | `2ⁿ` | eager if within limits, else lazy |
+| anything else | `v` (identity) | unbounded | lazy |
 
-The last row is always valid, because fixing the parameter fixes everything
-derived from it. There, each arm substitutes the parameter itself, which is
-correct because an identity-keyed arm is only entered for that exact value.
+In these forms, `v` is the parameter or a `zext` of it, and the operation is
+unsigned. `srem` and `sdiv`, which can produce negative keys, and any `trunc` or
+`sext` on the path, fall to the identity row.
+
+The identity row is always valid, because fixing the parameter fixes everything
+derived from it, and an identity-keyed arm is only entered for that exact value.
+Valid is not the same as useful, though. `table[slotNo + runtimeOffset]` keeps a
+dynamic offset whatever `slotNo` is. So **an arm is kept only if it folds more
+than the default arm.** The second PASS6 run reports a per-arm count of
+resolved sites; an arm that resolves nothing extra is dropped, and a compile
+with no arm left gets none.
 
 **Detection runs after the cell has been specialized**, not at AOT time. That
 covers a modulus that is itself configuration: in `v % c->numSlots`, `numSlots`
 is a `may_const` field, which phase 1c turns into a constant before detection
-looks. A literal modulus is the easy case of the same rule.
+looks.
 
-### 4.2 Region-level arms
+### 4.2 Supported form
+
+v1 transforms only a deliberately narrow form, and declines everything else,
+logging the reason (§7):
+
+1. **Entry-local sites.** The key-dependent sites are in the entry function
+   itself. Sites in non-inlined helpers have no common dominator with the entry
+   and stay generic. If every site is in a helper, the entry gets no arms.
+2. **A recognized projection** from the §4.1 table.
+3. **A rematerializable address chain.** Every instruction between `P` and the
+   key-dependent loads (the `urem`, the GEPs, any casts) must be speculatable and
+   side-effect free. It is **rematerialized inside each region**, so that an
+   address computed before the switch point does not stay on the original,
+   variable `P`, which would block folding in the arms.
+4. **Supported control flow.** Loops are in LoopSimplify form, with a preheader.
+   The region has no `invoke`, `callbr` or `indirectbr`, and no edges other than
+   ordinary branches, switches and returns.
+5. **Within limits.** Each region is at most `EJIT_SWITCH_CASE_MAX_REGION`, and
+   the total cloned is at most `EJIT_SWITCH_CASE_MAX_CLONED` (§3).
+
+### 4.3 Region-level arms
 
 Arms clone only the code that needs the key, not the whole entry. Whole-entry
-clones would copy the cell-only work (part A in §1, the fully unrolled loop) into
-every arm. In the example that is about 80% of each body.
+clones would copy the cell-only work (part A in §1.1, the fully unrolled loop)
+into every arm.
 
 **The switch point** is the latest program point that:
-1. dominates every key-dependent `may_const` site (§4.1); and
-2. is not inside a loop. `P` depends only on a parameter, so it is invariant in
-   every loop. A dominator inside a loop moves to the preheader of the outermost
-   loop containing it, which is ordinary loop unswitching.
+1. dominates every key-dependent site; and
+2. is not inside a loop. A dominator inside a loop moves to the preheader of the
+   outermost loop containing it, which is ordinary loop unswitching.
 
-`P` is rematerialized at the switch point: its operands are the parameter and
-constants.
+Hoisting is legal because §4.2 rule 3 makes `P` and the address chain
+speculatable. It can run `P`, and the lazy path's observation, on paths that
+never reach a key-dependent load, including zero-trip loops. That costs cycles
+and skews the lazy path's counts, but it is never incorrect.
 
 **Cloning.** The blocks dominated by the switch point are cloned once per key. In
-each clone `P` is replaced by the key; the originals become the default arm.
-Blocks where control rejoins and which the switch point does not dominate stay
-shared, with SSA repaired by `SSAUpdater`, as loop unswitching and jump
-threading already do. Identical dominated tails, such as `return r + slotNo`,
-are left for SimplifyCFG's tail merging. When the switch point is the entry
-block, the region is the whole body: whole-entry cloning is the degenerate case,
+each clone, `P` and the rematerialized address chain use the key; the originals
+become the default arm. Blocks where control rejoins and which the switch point
+does not dominate stay shared, with SSA repaired by `SSAUpdater`, as loop
+unswitching and jump threading already do. When the switch point is the entry
+block, the region is the whole body. Whole-entry cloning is the degenerate case,
 not a separate mechanism.
 
 Key-independent code *after* the switch point is still cloned with its region:
 work interleaved with key-dependent loads, or a whole loop unswitched on the key.
-Nothing at the IR level recovers it (§11, §12 question 4).
-
-**Where it runs**: a new step in `EJitOptimizer::runPipeline`, between phases 1c
-and 1d (`EJitOptimizer.cpp:187-194`):
-
-1. Phases 1a–1c run as today. The cell is substituted and its constants folded;
-   key-dependent loads are declined.
-2. **Detect `P`** (§4.1). If the runtime dim reaches no declined site, the
-   attribute has nothing to do: no arms, and the decline is logged (§7).
-3. **Place the switch point and clone the region** for the key set. With an
-   empty key set (before promotion), only the observation code (§5.3) is
-   inserted, and only if promotion is possible for this identity.
-4. Phases 1d–1f and the rest of the pipeline run **unchanged**. IPSCCP
-   propagates each arm's constants into helpers, and the second PASS6 run folds
-   the loads each key made addressable.
+The region limits bound it, and nothing at the IR level recovers it (§10).
 
 **Helpers.** The key substitution is local to each region clone, never a
 module-wide RAUW:
@@ -257,12 +302,23 @@ module-wide RAUW:
   generic by IPSCCP, which only folds arguments that agree at every call site;
 * a helper reached from one arm only is specialized for that arm alone.
 
-Neither case puts one arm's constants into another arm's code. The cost is that
-a non-inlined helper shared by arms stays generic. The AOT inliner has already
-expanded most callees (`EJitOptimizer.cpp:182-185`), which limits how often
-this happens.
+Neither case puts one arm's constants into another arm's code.
 
-### 4.3 Dispatch
+**Where it runs**: a new step in `EJitOptimizer::runPipeline`, between phases 1c
+and 1d (`EJitOptimizer.cpp:187-194`):
+
+1. Phases 1a–1c run as today. The cell is substituted and its constants folded;
+   key-dependent loads are declined.
+2. Detect `P` (§4.1) and check the supported form (§4.2).
+3. Choose the path and the keys (§5), place the switch point and clone the
+   regions. On the lazy path before promotion, there are no keys, and only the
+   observation code (§6.2) is inserted.
+4. Phases 1d–1f and the rest of the pipeline run unchanged over all arms. Then
+   the per-arm fold counts decide which arms survive (§4.1). Dropping an arm
+   means redirecting its `case` to the default region; SimplifyCFG deletes the
+   dead clone.
+
+### 4.4 Dispatch
 
 At the switch point:
 
@@ -276,333 +332,379 @@ No table lives outside the function, nothing is written at runtime, and the
 dispatch has no concurrency surface. The key needs no bounds check: the switch
 default *is* the out-of-set path.
 
-**Lowering is pinned to a compare chain.** Left to the backend, a switch with
-around four or more cases may become a jump table: a bounds check, a dependent
-load and an indirect branch. That is the serial load-then-branch the hit path
-should not carry. v1 sets `"no-jump-tables"="true"` on the specialization, so the
-switch lowers to at most `A_max` compare-and-branch pairs. The attribute is
-function-wide, so it also applies to any other switch in the body; the compile
-log reports when the body has one (§7). A jump table is allowed only if stage 6
-measures it faster for a given `K`.
+**Lowering is chosen by measurement, not fixed.** Left to the backend, a switch
+with around four or more cases may become a jump table: a dependent load and an
+indirect branch. A compare chain avoids those, but its cost depends on key
+distribution, branch prediction, arm size and layout, and a rapidly varying key
+can favour either. The levers are limited. `"no-jump-tables"` forbids jump tables
+but does not fix the shape of what replaces them, and it applies to every switch
+in the function. So v1 uses the backend's choice, and stage 3 (§9) measures it
+against the alternatives across `K` and key distributions before any lever is
+set.
 
 ---
 
-## 5. Collecting keys and promotion
+## 5. Choosing arms
 
-Arms are built lazily from the keys actually observed, not from a declared
-range. A range may not exist (identity projection), or may be much larger than
-the set in use.
+### 5.1 Policy
 
-### 5.1 Lifecycle of one identity
+At every compile of an identity, after §4.1–§4.2:
 
-| State | What calls run | Compared to today |
-|---|---|---|
-| **Not yet compiled** | AOT body: the miss path enqueues a compile and runs AOT meanwhile | Same |
-| **`COLLECTING`** | The specialization with **no arms**: cell folded, key-dependent loads generic, observation code at the switch point (§5.3) | Today's code, plus the observation cost |
-| **`PROMOTE_REQUESTED`** | Unchanged until the promoted code is published | Same as `COLLECTING` |
-| **`PROMOTED`** | Each core's next call misses once (§5.5), then: arms for keys in the set, the default arm for others | Better for keys in the set |
-| **Deactivated** (data update) | AOT during the window; afterwards a recompile **with arms immediately**, from the frozen key set | Same window; no re-collection |
+1. **Declined** (unsupported form, no key-dependent site): no arms.
+2. **Eager** when `M` is finite, `M <= A_max`, and `M` arms fit the region and
+   cloning limits.
+3. **Lazy** otherwise: `M` unbounded, or too many arms for the limits. This
+   applies only where promotion is possible: async compile mode, and the entry
+   not excluded (§10).
+4. Otherwise, no arms.
 
-**Nothing falls back to the AOT body because collection is incomplete.** The
-cell's constants are available from the first compile, and waiting for the keys
-would give up today's cell specialization for the whole collection window. The
-cost is one pre-promotion allocation per identity (§6). §11 lists running AOT
-until promotion as a future alternative.
+The choice is remade at every compile, so a configuration update that changes
+`P` (a new `numSlots`) simply moves the identity to whichever path now applies.
 
-### 5.2 The per-identity record
+### 5.2 Eager path
 
-PASS3 emits one global per switch-case entry, `@__ejit_rtdim_<name>`, in
-`.mc_shared`. It is indexed by the same `icacheLinearize` of the dims as the
-icache table (`EJitSharedTaskPool.cpp:287`), and it is registered by name
-alongside the icache slot. It holds one record per identity:
+The first compile builds all `M` arms. There is no observation, no record, no
+promotion, and nothing new at the inline cache. The identity's lifecycle is
+exactly today's, with arms in the code from the start. For `% 3`, this is the
+whole feature.
+
+---
+
+## 6. Lazy path
+
+### 6.1 Lifecycle
+
+| State | What calls run |
+|---|---|
+| Not yet compiled | AOT body, as today |
+| `COLLECTING` | The specialization without arms, with observation (§6.2) |
+| `FROZEN` | Same as `COLLECTING`; keys chosen, promotion being requested |
+| `QUEUED` | Same; promotion compile in flight |
+| `PROMOTED` | Arms for the chosen keys, the default arm for others. Every later compile, including after a data update, builds the arms immediately |
+| `KEEP_BASELINE` | The specialization without arms, and without observation from its next compile on. Terminal for the epoch |
+
+**Nothing falls back to the AOT body because collection is incomplete.** Waiting
+for the keys would give up today's cell specialization for the whole collection
+window. The cost is one pre-promotion allocation per identity (§8.1). §10 lists
+running AOT until promotion as a future alternative.
+
+### 6.2 Observation
+
+The lazy path collects **frequencies over a bounded window**, not first-seen
+keys. The domain is large or unknown there, and the keys seen at startup need not
+be the keys that dominate later.
+
+Before promotion the JIT emits this at the switch point, with the record's
+address and the current epoch baked in as constants:
 
 ```c
-struct EJitRtDimRecord {          // naturally aligned words only
-  uint32_t state;                 // COLLECTING, PROMOTE_REQUESTED, PROMOTED
-  uint32_t projTag;               // identifies P (§5.6); 0 = identity
-  uint32_t count;                 // keys recorded, <= A_max
-  uint32_t quiet;                 // switch-point executions since the last new key
-  uint32_t keys[A_max];
+uint32_t n = load_relaxed(&rec->calls) + 1;       /* lost updates tolerated */
+store_relaxed(&rec->calls, n);
+if ((n & (S - 1)) == 0 && load_relaxed(&rec->state) <= FROZEN)
+  ejit_rtdim_observe(rec, EPOCH, P(slotNo));      /* every S-th call */
+```
+
+JIT code only increments a sampling counter and reads `state`. Concurrent callers
+may lose increments, which shifts the sampling phase but corrupts nothing. Every
+other change to the record happens inside `ejit_rtdim_observe`. That is a runtime
+function made visible to JIT modules the way `ejit_vp_record_scalar` already is
+(`EJit.cpp:292`), and it takes the record lock (§6.3). So the design does
+**not** rely on one core per identity. This covers 0-dim entries, which several
+cores execute by design (`EJIT_ICACHE_SHARED_TABLE.md` §P1a), as well as
+overlapping tasks and migration. The observation code uses no read-modify-write
+atomic, so it cannot depend on outlined atomics (`EJitOptimizer.cpp:211-236`).
+
+`ejit_rtdim_observe`:
+1. `tryWrite` on the record lock. If it is busy, drop the sample. The call path
+   never waits, so interrupt reentry on the same core cannot deadlock.
+2. If the passed epoch differs from `rec->epoch`, drop the sample: it comes from
+   code compiled for an older collection.
+3. Count the key in a heavy-hitter table of `2·A_max` entries (space-saving).
+4. After `W` samples, close the window. Take the top `A_max` keys. If their
+   share of the window reaches the coverage threshold `C`, **freeze** them and
+   request promotion (§6.4). Otherwise clear the table and start another window;
+   after `R` windows below threshold, go to `KEEP_BASELINE`.
+
+`S`, `W`, `C` and `R` are runtime-configurable, with defaults set from stage 4
+data. Open question 1 asks what the real key distributions are.
+
+### 6.3 The record and its epoch
+
+PASS3 emits, per switch-case entry, `@__ejit_rtdim_<name>` in `.mc_shared`,
+registered by name alongside the icache slot. It holds a byte index over the
+identities (by `icacheLinearize`, `EJitSharedTaskPool.cpp:287`) into a small pool
+of records. The worker assigns a record when it first compiles an identity on the
+lazy path, and bakes its address into the code. Eager and declined identities
+never take one. A full pool puts the identity in `KEEP_BASELINE`, logged.
+
+```c
+struct EJitRtDimRecord {
+  EJitRwLock lock;                 // runtime only; tryWrite on the call path
+  uint32_t epoch;                  // bumped on every reset
+  uint32_t state;                  // §6.1
+  uint32_t projTag;                // identifies P
+  uint32_t calls;                  // sampling counter, written by JIT code
+  uint32_t samples, windows, attempts, promotions;
+  struct { uint32_t key, count; } table[2 * A_max];
+  uint32_t frozenCount;
+  uint32_t frozen[A_max];
 };
 ```
 
-It is **not** placed in `EJitSharedTaskPoolState`: that blob's layout and budget
-are fixed, and adding a field would move them for every build. The storage
-exists only in images that contain switch-case entries. A record is
-`16 + 4·A_max` bytes. At `A_max = 8` that is 48 bytes: 768 bytes for a 1-dim
-entry at `D = 16`, and 12 KiB for a 2-dim entry (§12 question 2).
+It is **not** placed in `EJitSharedTaskPoolState`, whose layout and budget are
+fixed for every build. At `A_max = 8` a record is about 200 bytes. The pool
+size, which bounds how many identities of one entry can use the lazy path, is
+open question 2.
 
-Writers are single-core. Under the deployment contract the inline cache already
-relies on, cores drive disjoint instance indices, so only one core executes a
-given identity and writes its record. The worker only reads the record, apart
-from resetting it (§5.6). So `keys[]` is written before `count`, `count` is
-stored with release and read with acquire, and **no read-modify-write atomic is
-needed**. That matters because JIT code must not depend on outlined atomics
-(`EJitOptimizer.cpp:211-236`).
+**The epoch is the collection's lifecycle.** Under the record lock:
+* **reset** bumps `epoch`, clears the table, `samples`, `windows` and `attempts`,
+  and sets `projTag`. Only the worker resets, at the start of a compile, when the
+  detected `P` differs from `projTag`, or on a generation change;
+* **a compile snapshot** reads `epoch`, `state` and the frozen keys together.
+  After a reset, code that is still running carries the old epoch, and step 2 of
+  §6.2 drops its samples. So old-projection keys never enter a new collection;
+* **a state transition** caused by a compile (published, rejected, failed)
+  applies only if `rec->epoch` still equals the snapshot's epoch. Otherwise the
+  result is published or discarded as usual, but the record is left to the newer
+  collection. Stale keys in published code are harmless: dispatch always
+  recomputes `P` with that code's own projection.
 
-### 5.3 Observation at the switch point
+### 6.4 Promotion state machine
 
-Before promotion the JIT emits this at the switch point, with the record's
-address baked in as a constant:
+Every exit has an explicit transition:
 
-```c
-uint32_t k = P(slotNo);
-if (load_monotonic(&rec->state) == COLLECTING) {
-  if (!contains(rec->keys, rec->count, k))       /* at most A_max compares */
-    ejit_rtdim_observe(rec, k);                  /* append; may promote */
-  else if (++rec->quiet == Q)                    /* plain load + store */
-    ejit_rtdim_observe(rec, k);                  /* quiet trigger */
-}
-```
-
-Only paths that reach a key-dependent load record a key. `ejit_rtdim_observe` is
-a runtime function made visible to JIT modules the way `ejit_vp_record_scalar`
-already is (`EJit.cpp:292`).
-
-**The block is emitted only where it can lead somewhere.** Promoted code omits
-it. So does any compile where promotion is impossible: sync mode (§5.4), and
-entries declined for PGO or bound pointers (§9). Those identities run exactly
-today's code, with no observation cost. The worker reads the compile mode when
-it compiles. An identity compiled in sync mode starts collecting at its next
-compile after the mode changes to async.
-
-### 5.4 Triggers and promotion
-
-Promotion is requested when either condition holds:
-
-* **Full**: `count == min(M, A_max)`. Every key the arms can hold has been seen.
-* **Quiet**: `quiet == Q` and `count > 0`. No new key has appeared in `Q`
-  executions of the switch point. Without this, an entry whose keys in use are a
-  strict subset of `M`, or whose projection is the identity, would collect
-  forever.
-
-When more than `A_max` distinct keys occur, v1 keeps the first `A_max` it sees.
-
-`ejit_rtdim_observe` sets `PROMOTE_REQUESTED` and enqueues a request for the
-identity with its current versions. It follows the shape of
-`enqueueTier2ForIdentity` (`EJitSharedTaskPool.cpp:1557`), including returning
-early outside async mode: compiling inline from inside JIT code would re-enter the
-compiler, so **promotion is async-only**.
-
-The worker compiles the identity as in §4.2 with the recorded key set, and
-publishes. A same-identity publish already replaces the slot's pointer
-(`EJitSharedTaskPool.cpp:3178-3185`). If the versions have moved on, publication
-fails with `VersionMismatch` as it does today. The record stays
-`PROMOTE_REQUESTED`, and the recompile after reactivation builds the arms.
-
-### 5.5 The inline cache
-
-`cachePublish` does not touch icache cells, so the cell for the identity keeps
-the pre-promotion pointer. After a successful promotion the worker calls
-`icacheDrainAll("rtdim-promote")`, the existing mechanism used for period toggles
-(`EJitSharedTaskPool.cpp:948`).
-
-**The drain is global.** It empties every entry's cells on every core, not just
-this identity's. Every entry, including ones without the attribute, pays one
-slow-path miss per core per promotion. The count is bounded (at most one
-promotion per identity per generation), but it lands during warm-up, when many
-identities promote close together. Stage 6 measures it. A per-identity cell
-clear is future work (§11).
-
-The alternative is not filling the cell until promotion, as PGO does for Tier-1
-(`EJitSharedTaskPool.cpp:834-838`). That keeps the whole collection window on
-the slow path and needs a new check in `icacheFill`, so v1 drains instead.
-
-### 5.6 After promotion
-
-* **The key set is frozen.** Every later compile of the identity, including the
-  recompile after a data update, builds the arms immediately from the stored
-  keys.
-* **A change to `P` resets collection.** When `P` depends on configuration
-  (`v % numSlots`), an update can change it. The worker compares the detected `P`
-  with `projTag`. On a mismatch it resets the record to `COLLECTING` and compiles
-  with no arms. Stale keys are harmless either way: dispatch always recomputes
-  `P` with the current code, so an arm for a key the new `P` never produces is
-  simply never selected.
-* **Owner re-initialization** (a generation change) clears all records.
-
----
-
-## 6. Costs
-
-This mode **spends code to buy specialization**. It does not save code.
-
-**Code pool.** Collection allocates nothing; the record is an AOT global. Two
-facts about the pool decide what the rest costs:
-* **pool memory is never released in v1.** `EJitCodePoolMemoryManager::deallocate`
-  runs the dealloc actions but does not return the memory, because sealed pages
-  must not be recycled (`EJitCodePoolMemoryManager.cpp:384-401`). This holds in
-  every build;
-* **with immediate 4K sealing, every allocation takes at least one page**
-  (`EJitCodePool.cpp:243-246`). With batched page sealing, allocations share
-  pages until the flush.
-
-| Per identity | Today | Switch-case |
+| From | Event | To |
 |---|---|---|
-| Shared code (before the switch point) | 1 copy | 1 copy |
-| Key-dependent region | 1 copy, generic | `K` specialized + 1 default |
-| First compile | 1 allocation | 1 allocation, slightly larger for the observation block |
-| Promotion | — | **+1 compile, +1 allocation.** The pre-promotion code stays resident as dead code |
-| Each recompile after a data update | 1 allocation | 1 allocation, larger by the `K` arm regions |
-| A promotion rejected at publish | — | Its allocation is consumed anyway, like any rejected publish today |
-| Hit path | icache probe → body | icache probe → body up to the switch point → `P` → switch → arm |
+| `COLLECTING` | window closes at or above coverage `C` | `FROZEN` |
+| `COLLECTING` | `R` windows below `C` | `KEEP_BASELINE` |
+| `FROZEN` | enqueue succeeds | `QUEUED` |
+| `FROZEN` | queue full, dedup declines, or not async | stay `FROZEN`; retry on the next sample; `attempts++` |
+| `FROZEN` | `attempts` exceeds its limit | `KEEP_BASELINE` |
+| `QUEUED` | published | `PROMOTED`; `promotions++`; clear the cell (§6.6) |
+| `QUEUED` | `VersionMismatch` or generation mismatch | `FROZEN` (the recompile after the data update also builds the arms) |
+| `QUEUED` | compile or seal failure, or the pool check fails (§3) | `KEEP_BASELINE` |
+| any | `P` changes and `promotions < EJIT_SWITCH_CASE_MAX_PROMOTIONS` | reset (§6.3) → `COLLECTING` |
+| any | `P` changes, promotion budget spent | `KEEP_BASELINE` |
+| any | generation change | record cleared |
 
-So the fixed extra cost is **one dead allocation per promoted identity**: one
-4 KiB page under immediate 4K sealing, as long as the pre-promotion code fits in a
-page.
+"Keys frozen" and "request queued" are separate states, so a failed enqueue
+never strands an identity. The promotion budget counts every promotion in the
+generation, including re-promotions after `P` changes. That also bounds the
+identity's lifetime pool growth and its cell clears.
 
-The recurring cost is paid on **every data update**. With `r` the size of the
-key-dependent region relative to the whole body, each recompile costs about
-`1 + K·r` times today's compile time and pool bytes, and none of it is ever
-freed. `A_max` bounds `K`, and region cloning keeps `r` small when the switch
-point is late (§12 question 4).
+Promotion is **async-only**: `ejit_rtdim_observe` never compiles, because
+compiling inline from inside JIT code would re-enter the compiler.
 
-**Cycles.** `P` costs one `and` for a mask, and about four instructions (multiply
-by reciprocal, shift, multiply-subtract) for a non-power-of-two modulus. The
-compare chain costs up to `K` compare-and-branch pairs (§4.3). The arm then
-skips the declined loads and the branches on them. Promotion also costs other
-entries a miss through the global drain (§5.5).
+### 6.5 Publication
 
-**Gate.** Stage 6 (§10) measures, on SRE, cycles/call for keys that reach an arm
-*and* for keys that reach the default arm, plus bytes and pool pages per
-identity. An entry may use the mode only if:
-* **no key is slower than today**, including keys that reach the default arm,
-  which pay `P` and the full compare chain for nothing;
-* the cycles saved justify the bytes added. The exchange rate is reported per
-  entry, so this decision is made with the numbers in hand.
+The promotion request is a baseline request for the identity, carrying a
+**promotion marker**. The worker must not send it through batch staging.
+`cacheStagePending` takes the slot matching the identity even when it is
+`Ready`, stores the new pointer as `Pending`, and releases the old function
+(`EJitSharedTaskPool.cpp:2932-3001`). Callers would lose today's specialization
+until the batch is flushed, and nothing makes a flush prompt.
 
-The **default-arm ratio** (§7) shows how often the arms actually serve calls. A
-high ratio means `A_max` or first-seen selection is wrong for that entry.
+So a marked request takes the direct path. The worker compiles, finalizes the
+code so it is executable, then replaces the `Ready` slot's pointer through
+`cachePublish` (`EJitSharedTaskPool.cpp:3178-3185`). The old specialization keeps
+serving until that store. The inline cache is on, so no code releaser is wired,
+and the old code stays executable for callers still inside it.
+
+How the marker is carried is open question 3.
+
+### 6.6 Inline cache: scoped cell clear
+
+A hit jumps straight into the specialization, so after promotion the identity's
+cell keeps the pre-promotion pointer until it is cleared. The global
+`icacheDrainAll` would do that, but it also evicts every unrelated hot entry on
+every core. Staggered promotions during warm-up would repeat that eviction. So
+v1 clears **one cell**, using the drain's existing protocol
+(`EJitSharedTaskPool.cpp:415`):
+
+1. `icacheDrainsInFlight.fetchAdd(1)`;
+2. store the table's **empty value** into the cell at
+   `icacheLinearize(dims)`: `&MissFn` for sentinel-form tables, whose probe
+   branches through the cell unconditionally, and 0 for guarded tables;
+3. bump `icacheDrainSeq` and retire the drain.
+
+A fill that resolved concurrently sees the drain and retracts itself, exactly as
+it does against a full drain, so the old pointer cannot be written back after the
+clear. `icacheArmed` is left alone. Promotions published in one worker step share
+one bracket. For 0-dim entries the fill stays gated by
+`icacheCrossCoreExecutable()`, as today.
 
 ---
 
 ## 7. Diagnostics
 
-The implementation logs every step of the mode, so that on SRE one can see from
-the logs alone:
-* which entries use it;
-* when each identity was promoted;
-* what each arm folded;
+Every step is logged, so that on SRE the logs alone show:
+* which entries use the mode, and which path each identity takes;
+* when an identity was promoted, and what each arm folded;
 * what it cost.
 
 All lines use the existing `EJIT_DIAG` macros (`EJitDiag.h`) with a common
-`rtdim` prefix for grepping. None is emitted from the inline observation block
-or from any hit path. They come only from compiles, from `ejit_rtdim_observe`
-(which runs only on a new key or a trigger), and from publication.
+`rtdim` prefix. None comes from JIT code or a hit path. They come only from
+compiles, from `ejit_rtdim_observe` (every `S`-th call at most), and from
+publication.
 
 | Event | Level | Content |
 |---|---|---|
-| Entry registered | `EJIT_DIAG_VERBOSE` | function, `A_max`, record count, record bytes |
-| Compile of a switch-case identity | `EJIT_DIAG` | function, dims, record state, `P` (`urem:C`, `and:mask`, `identity`), `M`, keys, arm count, switch-point block, region size, whether the body has another switch (§4.3) |
-| Per arm, at compile | `EJIT_DIAG_VERBOSE` | key, `may_const` sites folded in that arm against the default arm, from PASS6's counts |
-| Declined | `EJIT_DIAG`, once per function | reason: no key-dependent site, PGO, bound pointer, sync mode, attribute ignored because the option is off |
-| New key recorded | `EJIT_DIAG_VERBOSE` | function, identity, key, `count`/`min(M, A_max)` |
-| Promotion requested | `EJIT_DIAG` | function, identity, trigger (`full` / `quiet`), keys |
-| Promotion published | `EJIT_DIAG` | function, identity, arm count, code size before and after, pool bytes consumed by this allocation |
-| Promotion rejected | `EJIT_DIAG` | function, identity, reason (`VersionMismatch`, generation) |
-| `P` changed, collection reset | `EJIT_DIAG` | function, identity, old and new `projTag` |
+| Entry registered | `EJIT_DIAG_VERBOSE` | function, limits, record pool size |
+| Compile of an identity | `EJIT_DIAG` | function, dims, path (`eager` / `lazy` / `none`), `P` (`urem:C`, `and:mask`, `identity`), `M`, keys, arms kept, switch-point block, region and cloned sizes, whether the body has another switch |
+| Per arm | `EJIT_DIAG_VERBOSE` | key, sites resolved against the default arm; `dropped` if none |
+| Declined | `EJIT_DIAG`, once per function | reason: which §4.2 rule failed, a limit, PGO, bound pointer, sync mode, attribute ignored because the option is off |
+| Window closed | `EJIT_DIAG` | function, identity, epoch, samples, top keys, coverage, outcome |
+| State transition | `EJIT_DIAG` | function, identity, epoch, from → to, cause (every row of §6.4) |
+| Promotion published | `EJIT_DIAG` | function, identity, arm count, code size before and after, pool bytes of this allocation |
+| Reset | `EJIT_DIAG` | function, identity, old and new epoch, old and new `projTag` |
+| Cell clear | `EJIT_DIAG_VERBOSE` | function, identity, whether the cell held a pointer |
 
-The icache drain is already logged with its reason, `rtdim-promote`.
-
-**The default-arm ratio needs a counter, not a log**, because it is a hot-path
-property. A measurement-only build flag, `EJIT_SWITCH_CASE_STATS`, adds two
-counters to each record in `@__ejit_rtdim_<name>`: calls that reached an arm and
-calls that reached the default arm. It also makes promoted code increment them
-at the switch point, with the same single-writer plain load and store as §5.2.
-The runtime prints them per identity at shutdown, or on demand. The flag is off
-in every production build. No counters are added to
-`EJitSharedTaskPoolState.counters`, for the ABI reason in §5.2.
+**Coverage needs counters, not logs**, because it is a hot-path property. A
+measurement-only build flag, `EJIT_SWITCH_CASE_STATS`, makes the switch point
+count arm and default-arm executions per identity, in a side table beside the
+record. The runtime prints them at shutdown or on demand. The flag is off in
+production and **off when cycles are measured** (§8.2).
 
 ---
 
-## 8. Soundness rules
+## 8. Costs and measurement
 
-Each rule is stated where it arises; this is the checklist for review and tests.
+### 8.1 Costs
 
-1. **Only `P(runtime dim)` is substituted in an arm, never the parameter**,
-   unless `P` is the identity (§4.1). Test with a body that uses the raw value
-   (`r + slotNo`) and a call whose value differs from its key.
-2. **An arm is entered only through its `case`.** Region clones have no other
-   entry edge (§4.3).
-3. **The key substitution is local to its region clone**, never a module-wide
-   RAUW (§4.2). Test a non-inlined helper whose result differs between keys.
-4. **The runtime dim never enters the identity**: not the cache key, the request
-   or the icache index. This is what leaves §1.1 unchanged.
-5. **Promotion never compiles from JIT code** (§5.4).
+This mode spends code to buy speed. Two facts about the code pool decide the
+memory side:
+* **pool memory is never released in v1.** `EJitCodePoolMemoryManager::deallocate`
+  runs the dealloc actions but does not return the memory, because sealed pages
+  must not be recycled (`EJitCodePoolMemoryManager.cpp:384-401`);
+* **with immediate 4K sealing, every allocation takes at least one page**
+  (`EJitCodePool.cpp:243-246`). With batched page sealing, allocations share
+  pages until the flush.
 
----
+| Per identity | Today | Eager | Lazy |
+|---|---|---|---|
+| Key-dependent region | 1 generic copy | `M` specialized + 1 default | `K` specialized + 1 default, after promotion |
+| Compiles | 1 | 1 | 2 (initial + promotion) |
+| Dead allocations | — | — | 1: the pre-promotion code, never freed. One page under immediate 4K sealing |
+| Each recompile after a data update | 1 allocation | 1, larger by the arm regions | 1, larger by the arm regions |
+| Hit path | icache probe → body | probe → body to the switch point → `P` → dispatch → arm | same as eager, after promotion; before it, plus the sampling counter |
 
-## 9. Exclusions
+`1 + K·r` times today's size, with `r` the region's share of the body, is a
+**rough structural estimate only**. Cloning changes what the rest of the pipeline
+does: unrolling, inlining, register allocation and layout all respond to function
+size. So neither compile time nor allocation size is predicted from it, and "the
+default arm is today's code" does not mean it performs like today's compiled
+specialization. Both are measured.
 
-| Item | v1 |
+### 8.2 Measurement
+
+All measurements are taken on SRE, with the inline cache on. The gate checks
+that `-mllvm -ejit-inline-cache` is in the AOT compile command itself; a runtime
+cache entry alone does not emit the probe. Cycles are measured with
+`EJIT_SWITCH_CASE_STATS` off, and coverage separately with it on.
+
+**Region-size sweep (stage 3).** Vary the switch point's position and the region
+size in a synthetic entry: early, late, inside the main loop. Record emitted code
+and cycles per path. The results set `EJIT_SWITCH_CASE_MAX_REGION` and
+`EJIT_SWITCH_CASE_MAX_CLONED`, and decide the dispatch lowering (§4.4).
+
+**Gates (stage 7).** For each entry, against the three baselines of §1.2:
+
+| Metric | Gate |
 |---|---|
-| **Online PGO** | **Excluded.** Tier-1 and Tier-2 must number sites on the same CFG, and promotion changes the CFG, so a Tier-1 profile would not match a Tier-2 compile with arms. A switch-case entry stays at baseline. |
-| **`ejit_bound_ptr`** | **Excluded.** The promotion request is raised from JIT code, which has no bound-pointer descriptor to attach. |
-| `ejit_free_dim` | Independent. They are different parameters, and PASS6 keeps treating the free dim as today, inside every arm. |
+| Cycles/call, keys that reach an arm | improvement of at least `G_arm` over today |
+| Cycles/call, keys that reach the default arm | regression of at most `G_default` over today |
+| Tail latency: worst-case call over the run, including compile, promotion and cell-clear windows | at most `G_tail` over today |
+| Bytes and pool pages per identity | reported against each baseline |
+| Coverage (lazy path) | reported: share of calls served by arms |
+
+`G_arm`, `G_default` and `G_tail` are fixed from the stage 1 baseline **before**
+stage 7 runs, so they are not tuned to the result. An entry that misses a gate
+should not use the attribute.
 
 ---
 
-## 10. Staging
+## 9. Staging
 
 | Stage | Deliverable | Gate |
 |---|---|---|
-| 0 | `EJIT_SWITCH_CASE` and `EJIT_SWITCH_CASE_MAX_ARMS` options; attribute in `Attr.td`, Sema rules and CodeGen tag (§3) | OFF: byte-identical `ejit.o`, attribute warns and is ignored. ON: unchanged output for entries without it. Sema tests for every rule in §3 |
-| 1 | The §1 integration test, run with today's code | Baseline cycles/call, bytes/identity and pool usage to compare against |
-| 2 | Projection detection, switch-point placement and region cloning with an **injected** key set (a test hook on `SpecializationContext`); compile-time log lines (§4, §7) | `slotNo = 5` reaches the `k = 2` arm and returns `r + 5`; part A appears once in the output; each row of the §4.1 table; config-field modulus; key-dependent load inside a loop (switch hoisted to the preheader); differing non-inlined helper; entry with no key-dependent site gets no arms and logs the decline |
-| 3 | Record, observation, triggers, promotion, icache drain; runtime log lines (§5, §7) | Full and quiet triggers both fire; promoted code, sync-mode code and declined entries have no observation block; the log shows the promotion with before/after code size |
-| 4 | Post-promotion behaviour (§5.6) | Deactivate → modify → reactivate rebuilds the arms without re-collecting; a `projTag` change resets; generation reset |
-| 5 | PGO and bound-pointer exclusions (§9) | Such entries stay without arms, are not miscompiled, and log the decline |
-| 6 | Measurement on the stage 1 test, on SRE, with `EJIT_SWITCH_CASE_STATS` (§7) | The §6 gate: no key slower than today, including default-arm keys; the exchange rate; the default-arm ratio; the drain cost to entries without the attribute; compare chain against jump table per `K` |
+| 0 | `EJIT_SWITCH_CASE` and limit options; attribute in `Attr.td`, Sema rules and CodeGen tag (§3) | OFF: byte-identical `ejit.o`, attribute warns and is ignored. ON: unchanged output for entries without it. Sema tests for every rule in §3 |
+| 1 | The §1.1 integration test and a constant-table variant, run with today's code, inline cache on | Baselines for §8.2; gate values `G_*` fixed |
+| 2 | Projection detection, supported-form checks, region cloning, **eager path**, compile-time logs (§4, §5, §7) | End to end for `% 3`, with no runtime change. `slotNo = 5` reaches arm 2 and returns `r + 5`; part A appears once; each §4.1 form, including `srem` falling to identity; config-field modulus; address chain above the switch point rematerialized; key-dependent load behind a condition in a loop (hoisted, still correct on zero-trip); helper-only sites declined; arm with no extra folds dropped; every §4.2 decline logged |
+| 3 | Region-size sweep; dispatch lowering comparison (§4.4, §8.2) | Limits set; lowering chosen |
+| 4 | Lazy path: record pool, sampling, windows, epoch, state machine (§6.2–§6.4) | gtest: concurrent observers on one record, including a 0-dim entry, lose no correctness; old-epoch samples after a reset are dropped; every §6.4 transition, including queue full, dedup decline, sync mode, seal failure and pool-check failure; promotion budget honoured |
+| 5 | Promotion publication and scoped cell clear (§6.5, §6.6) | Marked requests never reach `cacheStagePending`; the old specialization serves until the replacement is executable; a fill racing the clear retracts; unrelated entries' cells are untouched |
+| 6 | PGO and bound-pointer exclusions (§10) | Such entries get no arms, are not miscompiled, and log the decline |
+| 7 | Measurement on SRE (§8.2) | The gates |
 
-Stages 0–2 need no runtime change. Stage 2 is where correctness is decided, and
-it can be tested completely with injected keys.
+Stage 2 delivers the eager path end to end with no runtime change, and it is
+where correctness is decided.
 
 ---
 
-## 11. Future work
+## 10. Exclusions and future work
 
-* **Run AOT until promotion.** Skip the pre-promotion compile. Collect keys on
-  the AOT path, and compile the identity only once, with its arms. This saves the
-  dead pre-promotion allocation (one page per identity under immediate 4K
-  sealing, §6) and one compile. It costs performance during collection: the
-  entry runs AOT instead of today's cell-specialized code until promotion, which
-  is below today's behaviour for that window. It also has to collect without `P`,
-  since a configuration-dependent modulus is only known after the cell is
-  specialized. The AOT path would record raw values, and the compile would apply
-  `P` to them. Worth considering if pool pages prove scarcer than collection-window
-  cycles on SRE.
+**Excluded in v1:**
+* **Online PGO.** Tier-1 and Tier-2 must number sites on the same CFG. Arms
+  change the CFG, so a switch-case entry stays at baseline;
+* **`ejit_bound_ptr` entries.** The promotion request is raised from JIT code,
+  which has no bound-pointer descriptor to attach;
+* sync mode, for the lazy path only (§5.1).
+
+`ejit_free_dim` is independent: it is a different parameter, and PASS6 keeps
+treating it as today, inside every arm.
+
+**Future work:**
+* **Run AOT until promotion.** Skip the lazy path's pre-promotion compile and
+  collect on the AOT path instead. This saves the dead allocation and a compile.
+  It costs performance during collection, since the entry runs below today's
+  code until promotion. It also has to collect raw values, since a
+  configuration-dependent `P` is only known after the cell is specialized.
+  Worth considering if pool pages prove scarcer than collection-window cycles.
 * **`MachineOutliner`**, for identical key-independent code left inside arms
-  (§4.2). It is compiled out under `EJIT_TRIM_LLVM_BACKEND`, so restoring it costs
-  runtime-library size. It also turns shared sequences in the hot path into
-  calls, and its cost model guarantees a size win, not a cycle win. Consider it
-  only if stage 6 shows significant duplication inside arms, and measure cycles
-  as well as bytes.
-* **Online PGO** for switch-case entries. This needs the key set frozen before
-  Tier-1, so both tiers compile the same CFG.
-* **`ejit_bound_ptr` entries.** This needs promotion routed through the next
-  slow-path call, which carries the descriptor.
-* **A per-identity icache clear** in place of the global drain at promotion
-  (§5.5).
-* More than one runtime dim per entry, and frequency-ranked key selection.
+  (§4.3). It is compiled out under `EJIT_TRIM_LLVM_BACKEND`, so restoring it costs
+  runtime-library size. It also turns shared hot-path sequences into calls, and it
+  only guarantees a size win. Consider it only if stage 7 shows significant
+  duplication, measuring cycles as well as bytes.
+* **Adapting frozen keys** when the dominant keys shift after promotion. Any
+  re-selection needs its own lifetime allocation budget, because each one leaves
+  unreclaimable code behind.
+* Online PGO and `ejit_bound_ptr` support; more than one runtime dim per entry;
+  sites in non-inlined helpers.
+
+---
+
+## 11. Soundness rules
+
+The checklist for review and tests; each rule is stated where it arises.
+
+1. **Only `P(runtime dim)` and its address chain are substituted in an arm,
+   never the parameter**, unless `P` is the identity (§4.1).
+2. **An arm is entered only through its `case`** (§4.4).
+3. **The key substitution is local to its region clone**, never a module-wide
+   RAUW (§4.3).
+4. **The runtime dim never enters the identity**: not the cache key, the request
+   or the icache index (§1.3).
+5. **Record state changes only under the record lock, and only for a matching
+   epoch** (§6.3).
+6. **Promotion never compiles from JIT code, and never goes through batch
+   staging** (§6.4, §6.5).
 
 ---
 
 ## 12. Open questions
 
-1. **Real key behaviour**: is `P` always a modulus or mask by a constant or a
-   configuration field? How many distinct keys does one cell see per TTI? These
-   set `A_max` and `Q`.
-2. **Record storage for 2-dim entries**: 12 KiB of `.mc_shared` at `A_max = 8`
-   and `D = 16`. Is that acceptable, or should records be allocated only for
-   identities that are actually compiled?
-3. **Does a request for an already-published identity recompile?** Tier-2 does,
-   but baseline requests go through batch staging
-   (`EJitSharedTaskPool.cpp:5266-5281`), and it needs checking whether staging
-   short-circuits a `Ready` identity. If it does, promotion needs its own request
-   marker. The two tier bits have a free value (`EJitSreQueue.h:100-107`), but
-   `isPublishedTier2` tests `>= kEJitTierPgoUse`, so using that value naively
-   would read as Tier-2.
+1. **Real key behaviour.** Is `P` usually a modulus or mask, by a constant or a
+   configuration field? How are the keys distributed per cell per TTI? This
+   decides how often the eager path applies, and sets `S`, `W`, `C` and `R`.
+2. **Record pool size per entry.** It bounds how many identities of one entry can
+   use the lazy path at about 200 bytes each.
+3. **The promotion marker.** It must reach the worker without an ABI change.
+   Two candidates:
+   * a high bit of `numDims`, mirroring the tier in `funcIndex`'s top bits
+     (`EJitSreQueue.h:100-107`). Every `numDims` consumer must then mask it;
+   * the free tier value. But `isPublishedTier2` tests `>= kEJitTierPgoUse`, so
+     that value would read as Tier-2 unless those comparisons are audited.
 4. **How often is the switch point late enough?** If real entries load
-   key-dependent data early, or inside their main loop, region cloning degrades
-   towards whole-body cloning. The compile log reports the switch-point block and
-   the region size (§7), which answers this.
+   key-dependent data early, or inside their main loop, regions approach the
+   whole body and the limits decline them. The compile log's switch-point block
+   and region size (§7) answer this on real entries.
