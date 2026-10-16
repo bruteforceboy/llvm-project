@@ -173,7 +173,10 @@ typedef struct {
 /// llvm::ejit::kVerifySiteNameMax.
 #define EJIT_VERIFY_SITE_NAME_MAX 64
 
-/// One instrumented may_const access, named "<func>:<global>+<byteOffset>".
+/// One instrumented may_const access. Direct names are "func:global+offset";
+/// indirect names identify the pointer global/slot or argument and field offset,
+/// with source location when available. Long indirect names end in a hash of
+/// the full descriptor, within the existing 64-byte name ABI.
 /// The totals say something diverged; this says which field did — and without
 /// EJIT_DIAG_ENABLE it is the only form that says so.
 typedef struct {

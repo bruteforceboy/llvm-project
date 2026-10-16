@@ -217,8 +217,8 @@ ALL_TESTS=(
 # runtime is an undefined-reference link failure, not a skip.
 if [[ -f "${BUILD_DIR}/CMakeCache.txt" ]] && \
    grep -q "^EJIT_VERIFY_SUBSTITUTION:BOOL=ON" "${BUILD_DIR}/CMakeCache.txt" 2>/dev/null; then
-  ALL_TESTS+=(ejit_verify_subst_test)
-  echo "Verifier:       EJIT_VERIFY_SUBSTITUTION=ON (ejit_verify_subst_test enabled)"
+  ALL_TESTS+=(ejit_verify_subst_test ejit_verify_indirect_test)
+  echo "Verifier:       EJIT_VERIFY_SUBSTITUTION=ON (verifier tests enabled)"
 fi
 
 # Per-test compile flags (e.g. for disabling global constructors)

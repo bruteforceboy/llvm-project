@@ -60,22 +60,24 @@ struct VerifyStats {
   uint64_t mismatches; ///< executions where memory != the frozen value
 };
 
-/// Longest site name retained per record, including the terminator. Names are
-/// "<func>:<global>+<byteOffset>"; anything longer is truncated rather than
-/// dropped, since the leading text is what locates the field.
+/// Longest site name retained per record, including the terminator. Direct
+/// sites use "func:global+offset"; indirect sites include the pointer
+/// global/slot or argument and field offset, plus source location when present.
+/// Long indirect names retain a hash of the full descriptor in their suffix;
+/// legacy direct names are truncated when copied into a runtime record.
 constexpr size_t kVerifySiteNameMax = 64;
 
 /// Number of distinct sites the runtime can account for individually. A
 /// fixed table: verify mode runs on targets where a diagnostic must not
 /// allocate. Sites past the limit still count toward the totals above.
-constexpr size_t kVerifyMaxSites = 64;
+constexpr size_t kVerifyMaxSites = 256;
 
 /// Per-site accounting, the form the classification is actually read in: which
 /// marked field diverged, how often, and against what. The totals alone cannot
 /// separate one moving field from a genuinely unstable set, and the log lines
 /// that name a site exist only in EJIT_DIAG_ENABLE builds.
 struct VerifySite {
-  char site[kVerifySiteNameMax]; ///< "<func>:<global>+<byteOffset>"
+  char site[kVerifySiteNameMax]; ///< bounded access identity (see above)
   uint64_t checks;               ///< executions of this site
   uint64_t mismatches;           ///< executions where memory != frozen
   uint64_t lastFrozen;           ///< frozen value at the most recent mismatch

@@ -1,4 +1,5 @@
-//===-- ejit_verify_print_stats_test.cpp - verifier report regression ------===//
+//===-- ejit_verify_print_stats_test.cpp - verifier report regression
+//------===//
 //
 // Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
 // See https://llvm.org/LICENSE.txt for license information.
@@ -75,7 +76,7 @@ int main() {
   ejitVerifyResetStats();
   report();
 #ifdef EJIT_DIAG_ENABLE
-  require(output.find("sites=0 checks=0 mismatches=0 records=0/64") !=
+  require(output.find("sites=0 checks=0 mismatches=0 records=0/256") !=
                   std::string::npos &&
               output.find("no verification coverage") != std::string::npos,
           "empty run explicitly reports missing coverage");
@@ -107,7 +108,7 @@ int main() {
   gEJitDiagLevel = EJIT_LOG_LVL_INFO;
   report();
 #ifdef EJIT_DIAG_ENABLE
-  require(output.find("sites=2 checks=41 mismatches=40 records=2/64") !=
+  require(output.find("sites=2 checks=41 mismatches=40 records=2/256") !=
               std::string::npos,
           "accurate totals");
   require(output.find("site=probe:cfg+0 checks=1 mismatches=0") !=
@@ -136,20 +137,29 @@ int main() {
   std::memset(name, 'x', sizeof(name) - 1);
   name[sizeof(name) - 1] = '\0';
   __ejit_verify_check(name, 1, 1);
-  for (unsigned i = 1; i < 66; ++i) {
+  for (unsigned i = 1; i < 258; ++i) {
     std::snprintf(name, sizeof(name), "probe:cfg+%u", i);
     __ejit_verify_check(name, 1, 1);
   }
+  // Records beyond the old 64-row limit retain individual evidence.
+  VerifySite extra;
+  require(ejitVerifySiteCount() == 256 && ejitVerifyGetSite(255, &extra) &&
+              std::strcmp(extra.site, "probe:cfg+255") == 0,
+          "all 256 records available");
+  __ejit_verify_check("probe:cfg+255", 1, 2);
+  require(ejitVerifyGetSite(255, &extra) && extra.checks == 2 &&
+              extra.mismatches == 1 && extra.lastActual == 2,
+          "record 255 keeps updating after table fills");
   gEJitDiagLevel = EJIT_LOG_LVL_INFO;
   report();
 #ifdef EJIT_DIAG_ENABLE
-  require(output.find("checks=66 mismatches=0 records=64/64") !=
+  require(output.find("checks=259 mismatches=1 records=256/256") !=
               std::string::npos,
           "overflow still counted in totals");
   require(output.find("site table full; additional sites may be totals-only") !=
               std::string::npos,
           "table capacity limitation reported");
-  require(lines == 66, "bounded report at table capacity");
+  require(lines == 259, "bounded report at table capacity");
 #endif
   ejitVerifyResetStats();
   report();

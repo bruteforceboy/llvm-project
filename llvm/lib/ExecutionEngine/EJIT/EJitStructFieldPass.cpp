@@ -20,6 +20,11 @@
 #include "llvm/IR/Operator.h"
 #include "llvm/Support/Casting.h"
 #include "llvm/Support/Debug.h"
+#ifdef EJIT_VERIFY_SUBSTITUTION
+#include "llvm/ADT/StringExtras.h"
+#include "llvm/Support/Path.h"
+#include "llvm/Support/xxhash.h"
+#endif
 #include "llvm/Transforms/Utils/Local.h"
 #include <algorithm>
 #include <cassert>
@@ -1822,13 +1827,69 @@ static std::optional<uint64_t> sumGEPChain(const Value *Ptr,
   return total;
 }
 
-/// "<func>:<global>+<byteOffset>" — locates the field from a log line, and is
-/// the per-site table key, so distinct fields must not collide. The
-/// indirect-pointer pattern has no root global; it keeps the offset past the
-/// dereference, which separates fields of the pointed-to struct.
-static std::string makeSiteName(const Function &F, const LoadInst *LI,
-                                const DataLayout &DL,
-                                const AssumedArgMap &Assumed) {
+/// Describe an absolute address using a unique registered object's identity.
+/// Pointer-valued periods have no pointee extent: match only authorized exact
+/// field offsets, as the absolute-address substitution path does. Aliased
+/// registrations are ambiguous, so retain the address instead of guessing.
+static std::string describeVerifyAbsolute(uint64_t Target,
+                                          const GVPeriodMap &GVMap,
+                                          const MayConstOffsetMap &Fields,
+                                          PeriodArrayRegistry &Registry,
+                                          const DataLayout &DL) {
+  std::string Found;
+  unsigned Matches = 0;
+  for (const auto &[GV, Info] : GVMap) {
+    std::string Candidate;
+    if (GV->getValueType()->isPointerTy()) {
+      if (DL.getPointerSize(0) != sizeof(void *))
+        continue;
+      void *Slot = resolveBase(GV, Info, Registry);
+      auto It = Fields.find(GV);
+      if (!Slot || It == Fields.end())
+        continue;
+      void *Pointee = nullptr;
+      std::memcpy(&Pointee, Slot, sizeof(Pointee));
+      const uintptr_t Base = reinterpret_cast<uintptr_t>(Pointee);
+      if (!Base || Target < Base ||
+          !llvm::is_contained(It->second, Target - Base))
+        continue;
+      Candidate =
+          "*" + GV->getName().str() + "->+" + std::to_string(Target - Base);
+    } else {
+      auto Object = getRegisteredNonPointerObject(GV, Info, Registry, DL);
+      if (!Object)
+        continue;
+      const uintptr_t Base = reinterpret_cast<uintptr_t>(Object->base);
+      if (Target < Base || Target - Base >= Object->size)
+        continue;
+      Candidate = GV->getName().str() + "+" + std::to_string(Target - Base);
+    }
+    Found = std::move(Candidate);
+    ++Matches;
+  }
+  return Matches == 1 ? Found : "addr=0x" + utohexstr(Target);
+}
+
+/// Keep the C ABI's 64-byte name buffer. A hash of the COMPLETE descriptor
+/// survives truncation, so long function/pointer names with a common prefix
+/// do not collapse into the same table row merely because their tails differ.
+static std::string boundedVerifyName(std::string Name) {
+  if (Name.size() < kVerifySiteNameMax)
+    return Name;
+  const std::string Suffix = "#" + utohexstr(xxHash64(Name));
+  Name.resize(kVerifySiteNameMax - 1 - Suffix.size());
+  return Name + Suffix;
+}
+
+/// Direct accesses keep the existing "func:global+offset" format. Indirect
+/// accesses identify the pointer slot, argument, or absolute address, plus a
+/// pointee byte offset. Source location is supplementary when debug info
+/// exists; source-level field names are not generally retained in optimized
+/// bitcode.
+static std::string
+makeSiteName(const Function &F, const LoadInst *LI, const DataLayout &DL,
+             const AssumedArgMap &Assumed, const GVPeriodMap &GVMap,
+             const MayConstOffsetMap &Fields, PeriodArrayRegistry &Registry) {
   const Value *Ptr = LI->getPointerOperand();
   std::string Out = F.getName().str() + ":";
   if (const GlobalVariable *GV = findRootGV(Ptr)) {
@@ -1837,19 +1898,52 @@ static std::string makeSiteName(const Function &F, const LoadInst *LI,
       Out += "+" + std::to_string(*Off);
     return Out;
   }
-  Out += "<indirect>";
-  if (auto Off = sumGEPChain(Ptr, DL, Assumed))
-    Out += "+" + std::to_string(*Off);
-  return Out;
+
+  if (auto Address = getAbsoluteTarget(Ptr, DL, Assumed)) {
+    Out += describeVerifyAbsolute(Address->getZExtValue(), GVMap, Fields,
+                                  Registry, DL);
+  } else {
+    const Value *Root = Ptr->stripPointerCasts();
+    while (auto *GEP = dyn_cast<GEPOperator>(Root))
+      Root = GEP->getPointerOperand()->stripPointerCasts();
+    if (const auto *Arg = dyn_cast<Argument>(Root)) {
+      Out += "arg" + std::to_string(Arg->getArgNo());
+      if (Arg->hasName())
+        Out += "(" + Arg->getName().str() + ")";
+    } else if (const auto *BaseLoad = dyn_cast<LoadInst>(Root)) {
+      const Value *Slot = BaseLoad->getPointerOperand();
+      if (const GlobalVariable *GV = findRootGV(Slot)) {
+        Out += "*" + GV->getName().str();
+        if (auto Off = accumulateFullOffset(DL, Slot, Assumed))
+          Out += "+" + std::to_string(*Off);
+        Out += "->";
+      } else {
+        raw_string_ostream OS(Out);
+        Root->printAsOperand(OS, false);
+      }
+    } else {
+      raw_string_ostream OS(Out);
+      Root->printAsOperand(OS, false);
+    }
+    if (auto Off = sumGEPChain(Ptr, DL, Assumed))
+      Out += "+" + std::to_string(*Off);
+  }
+  if (const DILocation *Loc = LI->getDebugLoc().get())
+    Out += "@" + sys::path::filename(Loc->getFilename()).str() + ":" +
+           std::to_string(Loc->getLine()) + ":" +
+           std::to_string(Loc->getColumn());
+  return boundedVerifyName(std::move(Out));
 }
 
 /// Keep \p LI and append a call comparing what it loads against \p Baked, the
 /// value substitution would have frozen. Returns false when the type cannot be
 /// widened, leaving the load untouched.
 static bool emitVerifyCheck(const Function &F, LoadInst *LI, Constant *Baked,
-                            const AssumedArgMap &Assumed,
-                            const DataLayout &DL,
-                            StringMap<Constant *> &SiteCache) {
+                            const AssumedArgMap &Assumed, const DataLayout &DL,
+                            StringMap<Constant *> &SiteCache,
+                            const GVPeriodMap &GVMap,
+                            const MayConstOffsetMap &Fields,
+                            PeriodArrayRegistry &Registry) {
   Module &M = *LI->getModule();
   LLVMContext &Ctx = M.getContext();
 
@@ -1862,8 +1956,9 @@ static bool emitVerifyCheck(const Function &F, LoadInst *LI, Constant *Baked,
     // Left neither substituted nor checked, so it is a hole in the run's
     // coverage rather than a clean result. Say so: silence here would read as
     // "this field never diverged".
-    EJIT_DIAG("verify SKIP site=%s: type not checkable (>64-bit or vector)",
-              makeSiteName(F, LI, DL, Assumed).c_str());
+    EJIT_DIAG(
+        "verify SKIP site=%s: type not checkable (>64-bit or vector)",
+        makeSiteName(F, LI, DL, Assumed, GVMap, Fields, Registry).c_str());
     return false;
   }
 
@@ -1874,9 +1969,11 @@ static bool emitVerifyCheck(const Function &F, LoadInst *LI, Constant *Baked,
                         {PtrTy, B.getInt64Ty(), B.getInt64Ty()},
                         /*isVarArg=*/false));
 
-  B.CreateCall(Check, {getSiteString(M, makeSiteName(F, LI, DL, Assumed),
-                                    SiteCache),
-                       Frozen, Actual});
+  B.CreateCall(
+      Check, {getSiteString(
+                  M, makeSiteName(F, LI, DL, Assumed, GVMap, Fields, Registry),
+                  SiteCache),
+              Frozen, Actual});
   LI->setMetadata(MD_EJIT_VERIFIED, MDNode::get(Ctx, {}));
   ejitVerifyNoteSite();
   return true;
@@ -2074,7 +2171,8 @@ EJitStructFieldPass::run(Function &F, FunctionAnalysisManager &AM) {
         continue;
       }
       ++verifyCandidates;
-      if (emitVerifyCheck(F, R.LI, R.ConstVal, freeDimArgs_, DL, siteCache)) {
+      if (emitVerifyCheck(F, R.LI, R.ConstVal, freeDimArgs_, DL, siteCache,
+                          gvPeriodMap_, mayConstFieldMap_, registry_)) {
         ++verifyInstrumented;
         changed = true;
       }
