@@ -381,7 +381,7 @@ def doit_gc_merge(args):
         # takes its address, which keeps it reachable.
         "ejit_init_verify", "ejit_verify_get_stats",
         "ejit_verify_reset_stats", "ejit_verify_available",
-        "ejit_verify_get_sites",
+        "ejit_verify_get_sites", "ejit_verify_print_stats",
         "ejit_register_lifecycle", "ejit_register_funcindex",
         "ejit_taskpool_compile_or_get", "ejit_taskpool_compile_or_get_bound",
         "ejit_taskpool_compile_or_get_bound_v",

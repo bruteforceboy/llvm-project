@@ -163,11 +163,11 @@ else
   _set_min_libs "${ARCH}"
   OTHER_LIBS=$(echo "${MIN_LIBS}" | sed '/^$/d' | tr '\n' ' ')
 fi
-# EJitLibcallStubs references the stack-protector ABI symbol __stack_chk_guard
-# by address; host glibc on x86_64 (TLS canary) no longer exports it as data.
-# Define it at 0 for the static link - the test binaries themselves compile
-# without stack protector, so nothing ever loads the value.
-LINK_LIBS="-lz -lpthread -ldl -Wl,--defsym,__stack_chk_guard=0"
+# EJitLibcallStubs uses a weak reference to __stack_chk_guard: resolve the
+# platform guard where available and leave it undefined otherwise (e.g. x86
+# glibc uses a TLS canary). Do not define it at address zero: that interposes
+# libc's own guard on AArch64 and can crash the loader before main.
+LINK_LIBS="-lz -lpthread -ldl"
 STRIP_FLAG="-Wl,--strip-all"
 if ${NO_STRIP}; then STRIP_FLAG=""; fi
 

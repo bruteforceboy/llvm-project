@@ -128,6 +128,48 @@ bool llvm::ejit::ejitVerifyGetSite(size_t index, VerifySite *out) {
   return true;
 }
 
+void llvm::ejit::ejitVerifyPrintStats() {
+#ifdef EJIT_DIAG_ENABLE
+  if (gEJitDiagLevel < EJIT_LOG_LVL_INFO)
+    return;
+
+  VerifyStats stats;
+  ejitVerifyGetStats(&stats);
+  const size_t count = ejitVerifySiteCount();
+  EJIT_DIAG_RAW("verify: sites=%llu checks=%llu mismatches=%llu records=%u/%u",
+                static_cast<unsigned long long>(stats.sites),
+                static_cast<unsigned long long>(stats.checks),
+                static_cast<unsigned long long>(stats.mismatches),
+                static_cast<unsigned>(count),
+                static_cast<unsigned>(kVerifyMaxSites));
+  ejitDiagPrintThrottle();
+  if (stats.checks == 0) {
+    EJIT_DIAG_RAW("verify: no checks executed; no verification coverage");
+    ejitDiagPrintThrottle();
+  }
+  if (count == kVerifyMaxSites) {
+    EJIT_DIAG_RAW(
+        "verify: site table full; additional sites may be totals-only");
+    ejitDiagPrintThrottle();
+  }
+  for (size_t i = 0; i < count; ++i) {
+    VerifySite site;
+    if (!ejitVerifyGetSite(i, &site))
+      continue;
+    EJIT_DIAG_RAW("verify: site=%s checks=%llu mismatches=%llu", site.site,
+                  static_cast<unsigned long long>(site.checks),
+                  static_cast<unsigned long long>(site.mismatches));
+    ejitDiagPrintThrottle();
+    if (site.mismatches != 0) {
+      EJIT_DIAG_RAW("  lastFrozen=0x%llx lastActual=0x%llx",
+                    static_cast<unsigned long long>(site.lastFrozen),
+                    static_cast<unsigned long long>(site.lastActual));
+      ejitDiagPrintThrottle();
+    }
+  }
+#endif
+}
+
 void llvm::ejit::ejitVerifyResetStats() {
   gSites.storeRelaxed(0);
   gChecks.storeRelaxed(0);

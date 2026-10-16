@@ -244,6 +244,16 @@ int main(int argc, char **argv) {
           (unsigned long long)moving->lastActual);
     }
 
+    // Exercise the public end-of-run report after shutdown: names and counters
+    // must remain available even though JIT modules have been released.
+    ejit_shutdown();
+    ejit_verify_print_stats();
+    ejit_verify_stats_t afterPrint;
+    snapshot(&afterPrint);
+    T(afterPrint.sites == st.sites && afterPrint.checks == st.checks &&
+      afterPrint.mismatches == st.mismatches,
+      "post-shutdown report preserves verifier counters");
+
     //===-- E: reset ------------------------------------------------------===//
     printf("\n--- E: counter reset ---\n");
 

@@ -881,10 +881,21 @@ call void @__ejit_verify_check(ptr @.ejit.verify.site, i64 4, i64 %3)
 int    ejit_verify_available(void);                 /* 是否编进了这个 runtime */
 void   ejit_verify_get_stats(ejit_verify_stats_t *);/* sites / checks / mismatches 总计 */
 size_t ejit_verify_get_sites(ejit_verify_site_t *, size_t max);  /* 逐 site 明细 */
+void   ejit_verify_print_stats(void);               /* SRE 日志：总计和逐 site 明细 */
 void   ejit_verify_reset_stats(void);               /* 用于框定一段 workload */
 ```
 
 `ejit_verify_site_t` 记录 site 名、checks、mismatches 以及最近一次 mismatch 的 frozen/actual 值。**总计数只说明"有东西漂移了"，分类要靠逐 site 明细** —— 而且在没开 `EJIT_DIAG_ENABLE` 的构建里，逐条 mismatch 的日志根本不存在，明细是唯一可读的形式。
+
+在 SRE 板上，构建时启用 `EJIT_VERIFY_SUBSTITUTION=ON`、
+`EJIT_DIAG_ENABLE=ON`、`EJIT_SRE_DIAG=ON`，用 `ejit_init_verify()` 初始化。
+业务运行结束、停止业务调用并 `ejit_drain_taskpool()` 后，调用
+`ejit_verify_print_stats()`（也可以在 `ejit_shutdown()` 后调用）：
+输出 sites/checks/mismatches 总计、每个已记录字段的 checks/mismatches，
+以及漂移字段最近的 frozen/actual 十六进制值。无检查执行时明确提示没有验证覆盖；
+表满时提示可能有仅计入总计的字段。输出逐行使用 SRE print throttle，
+应在 task 上下文调用。日志级别至少为 `EJIT_LOG_INFO`；没有编入诊断日志时该接口无输出。
+打印不清除计数，运行中的快照只是近似值；零 mismatch 只代表已执行检查的覆盖范围。
 
 per-site 表是固定容量（64 条，名字 64 字节，超长截断）：验证模式要能在不允许诊断路径分配内存的目标上运行。超出容量的 site 仍计入总计，只是没有单独记录。
 

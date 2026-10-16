@@ -797,6 +797,8 @@ size_t ejit_verify_get_sites(ejit_verify_site_t *out, size_t max) {
   return n;
 }
 
+void ejit_verify_print_stats(void) { llvm::ejit::ejitVerifyPrintStats(); }
+
 void ejit_verify_reset_stats(void) { llvm::ejit::ejitVerifyResetStats(); }
 
 #endif // EJIT_VERIFY_SUBSTITUTION

@@ -184,7 +184,7 @@ typedef struct {
   uint64_t lastActual;  ///< memory value at the most recent mismatch
 } ejit_verify_site_t;
 
-/// The five entry points below are DEFINED only under EJIT_VERIFY_SUBSTITUTION;
+/// The verifier entry points below are DEFINED only under EJIT_VERIFY_SUBSTITUTION;
 /// linking them otherwise is an undefined reference. They are declared
 /// unconditionally because a caller cannot see the runtime's build flags —
 /// test for the symbol at build time (ejit_test/build.sh reads CMakeCache)
@@ -207,6 +207,14 @@ void ejit_verify_get_stats(ejit_verify_stats_t *out);
 /// written (ordered by first execution). Sites past the runtime's fixed table
 /// capacity are counted in the totals but have no record.
 size_t ejit_verify_get_sites(ejit_verify_site_t *out, size_t max);
+
+/// Print totals and per-site evidence through the diagnostic logger (SRE_printf
+/// with EJIT_SRE_DIAG). Requires EJIT_DIAG_ENABLE and log level INFO or higher;
+/// otherwise a no-op. Does not reset counters and works after ejit_shutdown.
+/// Call from task context after draining compilation and stopping workload
+/// callers for a complete report. Live snapshots are approximate. Each output
+/// line uses the SRE diagnostic print throttle to avoid losing serial logs.
+void ejit_verify_print_stats(void);
 
 void ejit_verify_reset_stats(void);
 

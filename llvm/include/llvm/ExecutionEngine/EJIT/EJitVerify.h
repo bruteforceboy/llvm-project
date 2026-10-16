@@ -95,6 +95,10 @@ size_t ejitVerifySiteCount();
 /// a batch copy would need a table-sized buffer on the caller's stack.
 bool ejitVerifyGetSite(size_t index, VerifySite *out);
 
+/// Print a bounded, allocation-free diagnostic snapshot, including per-site
+/// evidence. Available after shutdown; a no-op when diagnostics are disabled.
+void ejitVerifyPrintStats();
+
 /// Zero the counters and drop every per-site record. Intended for tests
 /// bracketing a workload.
 void ejitVerifyResetStats();
