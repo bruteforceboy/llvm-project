@@ -107,6 +107,54 @@ specialization.
 
 ---
 
+### Bounded pointer-valued period globals
+
+A pointer-valued period global can consume a free-dimension witness when the
+application supplies the allocation behind it before `ejit_init`:
+
+```c
+ejit_period_arr(cell) CellConfig *configs;
+
+configs = calloc(cellCount, sizeof(*configs));
+ejit_status_t status = ejit_register_pointer_period_bounds(
+    "configs", configs, cellCount * sizeof(*configs));
+// Check status == EJIT_OK, then initialize the data and call ejit_init.
+```
+
+The base is the pointer value, not `&configs`. The extent is the number of
+valid pointee bytes, not `sizeof(configs)` and not a lifecycle instance count.
+The existing generated period registration still supplies `&configs` and its
+lifecycle; the new registration supplements it. It works with constructor and
+forced linker-table registration. Bounds alone do not disable table discovery.
+The C API rejects invalid or conflicting bounds and all post-init calls.
+
+Clang records an additive `ejit_pointer_layout` node on pointer-period globals:
+the pointee element stride followed by `(offset, size)` ranges for its marked
+fields. Nested fixed arrays are expanded, so fields inside slot rings are
+authorized too. Bitfields, unions, volatile/atomic fields, incomplete types,
+and base subobjects do not gain field-range authorization. Metadata generation
+has a 4096-node work budget; exhausting it withholds the whole new layout.
+Without explicit bounds, old bitcode retains the legacy unbounded-pointer
+behavior. Supplying bounds without the new layout leaves field loads dynamic.
+
+The optimizer matches the current pointee against the registered base, requires
+the consuming entry's lifecycle contract, checks every flagged GEP intermediate
+and the complete access against the allocation, and checks that the access fits
+within a marked field of a repeated pointee element. The extent must contain a
+whole number of these elements. Ambiguous eligible registrations do not fold.
+Only the marked load's result is replaced; slot-dependent stores, calls, and
+ordinary loads retain their runtime arguments.
+
+The allocation must remain mapped until shutdown. Bounds are pinned to that
+allocation: changing the pointer does not transfer them to another allocation.
+For a new allocation, shut down and register the new bounds before reinitializing.
+Existing lifecycle transitions must still retire specializations before marked
+values change. `ejit_free_dim` remains the application's promise of value
+invariance and a valid zero witness; registering bounds does not prove either.
+
+Recompile AOT bitcode with the updated Clang and link the updated runtime to
+use this path. Existing registration-table entries and wrapper ABIs are unchanged.
+
 ## 4. Not a dimension on the wire
 
 `ejit_free_dim` is not part of the specialization identity:

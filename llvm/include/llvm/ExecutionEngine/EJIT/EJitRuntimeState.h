@@ -33,6 +33,14 @@ struct StaticVarInfo {
   void *varAddr;
 };
 
+/// An explicitly registered allocation behind a pointer-valued period global.
+/// The base is pinned: changing the pointer does not transfer these bounds to
+/// another allocation, even if that allocation happens to have the same type.
+struct PointerPeriodBounds {
+  const void *base;
+  uint64_t size;
+};
+
 /// Registry of period arrays and static variables. Initialized once
 /// at ejit_init time from StoredData, then read-only at runtime.
 class PeriodArrayRegistry {
@@ -41,6 +49,10 @@ public:
                      const std::string &varName,
                      void *baseAddr, size_t size);
   void registerStaticVar(const std::string &varName, void *varAddr);
+  bool registerPointerPeriodBounds(const std::string &varName, const void *base,
+                                   uint64_t size);
+  const PointerPeriodBounds *
+  getPointerPeriodBounds(const std::string &varName) const;
 
   const std::vector<PeriodArrayInfo> *getArrays(const std::string &periodName) const;
   const std::vector<StaticVarInfo> &getStaticVars() const { return staticVars_; }
@@ -63,6 +75,7 @@ private:
   // invalidate pointers to vector elements on reallocation).
   std::unordered_map<std::string, PeriodArrayInfo> varNameIndex_;
   std::unordered_map<std::string, void *> staticVarIndex_;
+  std::unordered_map<std::string, PointerPeriodBounds> pointerBounds_;
   std::unordered_map<uintptr_t, PeriodArrayInfo> baseAddrIndex_;
 };
 

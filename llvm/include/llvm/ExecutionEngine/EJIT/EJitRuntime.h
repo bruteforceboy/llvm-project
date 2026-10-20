@@ -95,6 +95,19 @@ typedef enum {
   EJIT_STATUS_ICACHE_HIT_SENTINEL = 0xFE,
 } ejit_status_t;
 
+/// Supply the allocation behind an auto-registered pointer-valued period
+/// global. Call after allocating/initializing the pointee and BEFORE ejit_init.
+/// varName is its LLVM symbol name; base is the pointer VALUE, not &pointer;
+/// size is the number of valid bytes starting at base, not sizeof(pointer).
+/// The allocation must remain mapped and the bounds registration is fixed until
+/// shutdown. A different pointer value is not covered. Existing lifecycle and
+/// ejit_free_dim contracts still govern which marked values may be frozen.
+/// Duplicate identical bounds are accepted; invalid/conflicting bounds and all
+/// post-init calls return EJIT_ERR_INVALID_PARAM without changing registration.
+ejit_status_t ejit_register_pointer_period_bounds(const char *varName,
+                                                  const void *base,
+                                                  uint64_t size);
+
 typedef enum {
   EJIT_COMPILE_SYNC = 0,
   EJIT_COMPILE_ASYNC = 1,

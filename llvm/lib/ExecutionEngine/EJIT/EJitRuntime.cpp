@@ -501,6 +501,19 @@ void ejit_register_static_var(const char *varName, void *varAddr) {
   }
 }
 
+ejit_status_t ejit_register_pointer_period_bounds(const char *varName,
+                                                  const void *base,
+                                                  uint64_t size) {
+  // Registry readers on compiler workers are lock-free. Keep this additive
+  // registration strictly pre-init, including in hosted/non-taskpool builds.
+  if (gEJIT || !varName || !*varName)
+    return EJIT_ERR_INVALID_PARAM;
+  return EJitRegistrationStore::instance().registerPointerPeriodBounds(
+             varName, base, size)
+             ? EJIT_OK
+             : EJIT_ERR_INVALID_PARAM;
+}
+
 void ejit_register_lifecycle(const char *lifecycleName, uint32_t *slotOut) {
   // Self-contained: the dimType-slot assignment lives in a process-global
   // registry that exists independently of the EJit instance, so this works

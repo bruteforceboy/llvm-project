@@ -163,11 +163,13 @@ else
   _set_min_libs "${ARCH}"
   OTHER_LIBS=$(echo "${MIN_LIBS}" | sed '/^$/d' | tr '\n' ' ')
 fi
-# EJitLibcallStubs references the stack-protector ABI symbol __stack_chk_guard
-# by address; host glibc on x86_64 (TLS canary) no longer exports it as data.
-# Define it at 0 for the static link - the test binaries themselves compile
-# without stack protector, so nothing ever loads the value.
-LINK_LIBS="-lz -lpthread -ldl -Wl,--defsym,__stack_chk_guard=0"
+# AArch64 libc exports a real stack guard: an absolute-zero override interposes
+# libc's own accesses and can crash its startup. Keep the legacy link placeholder
+# only for x86_64's TLS canary ABI, which does not export this data symbol.
+LINK_LIBS="-lz -lpthread -ldl"
+if [[ "${ARCH}" == "x86" ]]; then
+  LINK_LIBS="${LINK_LIBS} -Wl,--defsym,__stack_chk_guard=0"
+fi
 STRIP_FLAG="-Wl,--strip-all"
 if ${NO_STRIP}; then STRIP_FLAG=""; fi
 
@@ -203,6 +205,7 @@ ALL_TESTS=(
   ejit_fixed_dim_test
   ejit_perf_bench
   ejit_ptr_period_test
+  ejit_pointer_period_bounds_test
   ejit_trace_test
   ejit_volatile_test
   ejit_l0_dispatch_test

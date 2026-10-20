@@ -3,6 +3,7 @@
 
 #include "llvm/ExecutionEngine/EJIT/EJitRegistrationStore.h"
 #include "llvm/ExecutionEngine/EJIT/EJitDiag.h"
+#include <limits>
 #include <mutex>
 
 using namespace llvm::ejit;
@@ -10,6 +11,20 @@ using namespace llvm::ejit;
 EJitRegistrationStore &EJitRegistrationStore::instance() {
   static EJitRegistrationStore store;
   return store;
+}
+
+bool EJitRegistrationStore::registerPointerPeriodBounds(
+    const std::string &varName, const void *base, uint64_t size) {
+  if (varName.empty() || !base || !size ||
+      size > std::numeric_limits<uintptr_t>::max() -
+                 reinterpret_cast<uintptr_t>(base))
+    return false;
+  std::lock_guard<decltype(mutex_)> lock(mutex_);
+  for (const auto &Entry : pointerPeriodBounds_)
+    if (Entry.varName == varName)
+      return Entry.base == base && Entry.size == size;
+  pointerPeriodBounds_.push_back({varName, base, size});
+  return true;
 }
 
 void EJitRegistrationStore::registerBitcode(const std::string &funcName,
@@ -90,6 +105,8 @@ StoredData EJitRegistrationStore::consume() {
   data.periodArrays = std::move(periodArrays_);
   data.staticVars = std::move(staticVars_);
   data.userSymbols = std::move(userSymbols_);
+  data.pointerPeriodBounds = std::move(pointerPeriodBounds_);
+  pointerPeriodBounds_.clear();
   bitcodes_.clear();
   periodArrays_.clear();
   staticVars_.clear();

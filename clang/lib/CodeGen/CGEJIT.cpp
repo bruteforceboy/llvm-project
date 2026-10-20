@@ -219,6 +219,52 @@ static void collectBoundMayConstFields(
   }
 }
 
+/// Record complete field ranges in one pointee element, including nested slot
+/// arrays. Keep this separate from the legacy offset-only fallback: these
+/// ranges authorize bounded absolute-address reads after pointer substitution.
+/// A work budget bounds metadata growth; an incomplete layout authorizes
+/// nothing.
+static bool collectPointerPeriodFields(
+    ASTContext &Ctx, QualType Ty, uint64_t Base,
+    SmallVectorImpl<std::pair<uint64_t, uint64_t>> &Fields, unsigned &Budget) {
+  if (!Budget || Ty->isIncompleteType() || Ty->isVariablyModifiedType())
+    return false;
+  --Budget;
+  if (Ty.isVolatileQualified() || Ty->isAtomicType())
+    return true;
+  if (const auto *AT = Ctx.getAsConstantArrayType(Ty)) {
+    uint64_t Count = AT->getSize().getLimitedValue();
+    uint64_t Stride =
+        Ctx.getTypeSizeInChars(AT->getElementType()).getQuantity();
+    for (uint64_t I = 0; I < Count; ++I)
+      if (!collectPointerPeriodFields(Ctx, AT->getElementType(),
+                                      Base + I * Stride, Fields, Budget))
+        return false;
+    return true;
+  }
+  const auto *RD = Ty->getAsRecordDecl();
+  if (!RD || RD->isUnion())
+    return true;
+  // Base subobjects are not described by this C field walker.
+  if (const auto *CXXRD = dyn_cast<CXXRecordDecl>(RD))
+    if (CXXRD->getNumBases())
+      return false;
+  const ASTRecordLayout &Layout = Ctx.getASTRecordLayout(RD);
+  for (const FieldDecl *FD : RD->fields()) {
+    QualType FT = FD->getType();
+    if (FD->isBitField() || FT.isVolatileQualified() || FT->isAtomicType())
+      continue;
+    if (FT->isIncompleteType() || FT->isVariablyModifiedType())
+      continue;
+    uint64_t Offset = Base + Layout.getFieldOffset(FD->getFieldIndex()) / 8;
+    if (FD->hasAttr<EjitMayConstAttr>())
+      Fields.emplace_back(Offset, Ctx.getTypeSizeInChars(FT).getQuantity());
+    if (!collectPointerPeriodFields(Ctx, FT, Offset, Fields, Budget))
+      return false;
+  }
+  return true;
+}
+
 /// Emit !ejit.metadata for an ejit_period or ejit_period_arr global variable.
 void clang::CodeGen::emitEjitGlobalMetadata(CodeGenModule &CGM,
                                             const VarDecl *VD,
@@ -266,6 +312,26 @@ void clang::CodeGen::emitEjitGlobalMetadata(CodeGenModule &CGM,
                 llvm::ConstantInt::get(llvm::Type::getInt32Ty(Ctx), Off))
         }));
       }
+    }
+  }
+
+  if (!Entries.empty() && VD->getType()->isPointerType()) {
+    QualType Pointee = VD->getType()->getPointeeType();
+    SmallVector<std::pair<uint64_t, uint64_t>, 16> Fields;
+    unsigned Budget = 4096;
+    if (collectPointerPeriodFields(CGM.getContext(), Pointee, 0, Fields,
+                                   Budget) &&
+        !Fields.empty()) {
+      auto IntMD = [&](uint64_t V) {
+        return llvm::ConstantAsMetadata::get(
+            llvm::ConstantInt::get(llvm::Type::getInt64Ty(Ctx), V));
+      };
+      SmallVector<llvm::Metadata *, 16> Layout = {
+          llvm::MDString::get(Ctx, "ejit_pointer_layout"),
+          IntMD(CGM.getContext().getTypeSizeInChars(Pointee).getQuantity())};
+      for (const auto &[Offset, Size] : Fields)
+        Layout.push_back(llvm::MDNode::get(Ctx, {IntMD(Offset), IntMD(Size)}));
+      Entries.push_back(llvm::MDNode::get(Ctx, Layout));
     }
   }
 

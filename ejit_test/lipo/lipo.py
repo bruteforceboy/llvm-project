@@ -361,6 +361,7 @@ def doit_gc_merge(args):
         "ejit_get_stats",
         "ejit_register_symbol", "ejit_register_bitcode",
         "ejit_register_period_array", "ejit_register_static_var",
+        "ejit_register_pointer_period_bounds",
         "ejit_clear_cache", "ejit_compile_or_get", "ejit_invalidate",
         "ejit_set_compile_mode", "ejit_get_compile_mode", "ejit_get_last_error",
         # General diagnostics (always available — defined outside the

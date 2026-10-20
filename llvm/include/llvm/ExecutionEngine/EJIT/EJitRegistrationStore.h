@@ -45,6 +45,12 @@ struct SymbolEntry {
   void *addr;
 };
 
+struct PointerPeriodBoundsEntry {
+  std::string varName;
+  const void *base;
+  uint64_t size;
+};
+
 /// A registration failure recorded before/at ejit_init (e.g. funcIndex or
 /// lifecycle capacity exhausted in a constructor-phase callback). Surfaced so
 /// ejit_init can fail instead of silently building a half-registered taskpool.
@@ -61,8 +67,11 @@ struct StoredData {
   std::vector<PeriodArrayEntry> periodArrays;
   std::vector<StaticVarEntry> staticVars;
   std::vector<SymbolEntry> userSymbols;
+  std::vector<PointerPeriodBoundsEntry> pointerPeriodBounds;
 
   bool empty() const {
+    // Bounds supplement generated registrations; bounds alone must not
+    // suppress linker-table discovery when constructors are disabled.
     return bitcodes.empty() && periodArrays.empty() && staticVars.empty() &&
            userSymbols.empty();
   }
@@ -85,6 +94,8 @@ public:
                            const std::string &varName, void *baseAddr,
                            uint64_t arraySize);
   void registerStaticVar(const std::string &varName, void *varAddr);
+  bool registerPointerPeriodBounds(const std::string &varName, const void *base,
+                                   uint64_t size);
   void registerSymbol(const std::string &name, void *addr);
 
   /// Record the FIRST registration failure (subsequent calls are ignored so the
@@ -108,6 +119,7 @@ private:
   std::vector<BitcodeEntry> bitcodes_;
   std::vector<PeriodArrayEntry> periodArrays_;
   std::vector<StaticVarEntry> staticVars_;
+  std::vector<PointerPeriodBoundsEntry> pointerPeriodBounds_;
   std::vector<SymbolEntry> userSymbols_;
   RegistrationError error_;
 };

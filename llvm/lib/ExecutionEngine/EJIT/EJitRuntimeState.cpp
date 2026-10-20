@@ -3,9 +3,28 @@
 #include "llvm/ExecutionEngine/EJIT/EJitRuntimeState.h"
 #include "llvm/ExecutionEngine/EJIT/EJitDiag.h"
 #include <cassert>
+#include <limits>
 #include <mutex>
 
 using namespace llvm::ejit;
+
+bool PeriodArrayRegistry::registerPointerPeriodBounds(
+    const std::string &varName, const void *base, uint64_t size) {
+  if (varName.empty() || !base || !size ||
+      size > std::numeric_limits<uintptr_t>::max() -
+                 reinterpret_cast<uintptr_t>(base))
+    return false;
+  auto Insert =
+      pointerBounds_.emplace(varName, PointerPeriodBounds{base, size});
+  return Insert.second || (Insert.first->second.base == base &&
+                           Insert.first->second.size == size);
+}
+
+const PointerPeriodBounds *
+PeriodArrayRegistry::getPointerPeriodBounds(const std::string &varName) const {
+  auto It = pointerBounds_.find(varName);
+  return It == pointerBounds_.end() ? nullptr : &It->second;
+}
 
 void PeriodArrayRegistry::registerArray(const std::string &periodName,
                                         const std::string &varName,
