@@ -1020,9 +1020,12 @@ static Constant *createConstantFromMemory(const void *addr, Type *Ty,
     if (byteSize > 8)
       return nullptr;
     uint64_t raw = 0;
-    std::memcpy(&raw, addr, byteSize);
-    if (!DL.isLittleEndian())
-      raw >>= (8 - byteSize) * 8;
+    const auto *Bytes = static_cast<const uint8_t *>(addr);
+    // Decode in target byte order; the host's may differ.
+    for (unsigned I = 0; I < byteSize; ++I) {
+      unsigned Shift = DL.isLittleEndian() ? I : byteSize - 1 - I;
+      raw |= static_cast<uint64_t>(Bytes[I]) << (Shift * 8);
+    }
     return ConstantInt::get(Ty, APInt(byteSize * 8, raw));
   }
   if (Ty->isFloatTy()) {
@@ -1463,12 +1466,63 @@ static bool absoluteFieldAuthorized(
          ejitAccessFitsMayConstField(GV, FieldOffset, AccessSize, DL);
 }
 
+/// Authorize a complete access within one compiler-described pointee element.
+/// Field ranges include nested arrays; the allocation may hold several
+/// pointee elements.
+static bool boundedPointerFieldAuthorized(const GlobalVariable &GV,
+                                          uint64_t AllocationSize,
+                                          uint64_t Relative,
+                                          uint64_t AccessSize) {
+  MDNode *MD = GV.getMetadata(MD_EJIT_METADATA);
+  if (!MD)
+    return false;
+  const MDNode *Layout = nullptr;
+  for (const MDOperand &Op : MD->operands()) {
+    auto *Node = dyn_cast<MDNode>(Op.get());
+    if (!Node || Node->getNumOperands() < 2)
+      continue;
+    auto *Tag = dyn_cast<MDString>(Node->getOperand(0));
+    if (Tag && Tag->getString() == "ejit_pointer_layout") {
+      if (Layout)
+        return false;
+      Layout = Node;
+    }
+  }
+  if (!Layout)
+    return false;
+  auto *StrideMD = mdconst::dyn_extract<ConstantInt>(Layout->getOperand(1));
+  if (!StrideMD || StrideMD->getBitWidth() > 64)
+    return false;
+  uint64_t Stride = StrideMD->getZExtValue();
+  if (!Stride || AllocationSize % Stride)
+    return false;
+  uint64_t Offset = Relative % Stride;
+  bool Authorized = false;
+  for (unsigned I = 2; I < Layout->getNumOperands(); ++I) {
+    auto *Field = dyn_cast<MDNode>(Layout->getOperand(I));
+    if (!Field || Field->getNumOperands() != 2)
+      return false;
+    auto *BeginMD = mdconst::dyn_extract<ConstantInt>(Field->getOperand(0));
+    auto *SizeMD = mdconst::dyn_extract<ConstantInt>(Field->getOperand(1));
+    if (!BeginMD || !SizeMD || BeginMD->getBitWidth() > 64 ||
+        SizeMD->getBitWidth() > 64)
+      return false;
+    uint64_t Begin = BeginMD->getZExtValue(), Size = SizeMD->getZExtValue();
+    if (!Size || Begin > Stride || Size > Stride - Begin)
+      return false;
+    Authorized |= Offset >= Begin && Offset - Begin <= Size &&
+                  AccessSize <= Size - (Offset - Begin);
+  }
+  return Authorized;
+}
+
 /// Resolve a may_const load after IPSCCP/InstCombine has propagated a period
 /// pointer into a callee and folded its GEP into an absolute address. For a
 /// non-pointer registered object, accept only a unique, bounded and authorized
 /// field whose complete root-to-leaf GEP witness is valid. Pointer-form objects
-/// retain the old exact-field/constant-index path; their pointee extent is not
-/// present in the registry, so a free-dim witness is never used for them.
+/// with explicit allocation bounds and compiler field ranges use the same
+/// witness checks. Unbounded pointers retain the legacy constant-index path.
+/// Allocator-discovered bounds only add witness folds.
 static Constant *tryReplacePeriodAbsoluteAddress(
     LoadInst *LI, const Function &F, const GVPeriodMap &gvMap,
     const MayConstOffsetMap &mayConstFieldMap, PeriodArrayRegistry &reg,
@@ -1488,15 +1542,19 @@ static Constant *tryReplacePeriodAbsoluteAddress(
 
   unsigned Matches = 0;
   const uint8_t *Candidate = nullptr;
+  // Kept apart so a discovered match never overrides or makes ambiguous a
+  // match that exists without an allocation lookup.
+  unsigned DiscoveredMatches = 0;
+  const uint8_t *DiscoveredCandidate = nullptr;
   for (const auto &[GV, Info] : gvMap) {
     if (GV->getValueType()->isPointerTy()) {
       // Preserve the pre-existing constant-address path for pointer-valued
       // periods. It deliberately does not require the helper itself to carry
       // the consuming entry's lifecycle metadata: the pointer materialization
       // and the old absolute-address fold are also used through non-inlined
-      // helpers. The pointee's complete extent is unknown, so this path cannot
-      // consume a free-dim witness.
-      if (UsedAssumption || DL.getPointerSize(0) != sizeof(void *))
+      // helpers. Only supplied bounds below allow a free-dim witness; the
+      // legacy registration does not describe the pointee's extent.
+      if (DL.getPointerSize(0) != sizeof(void *))
         continue;
       void *PointerSlot = resolveBase(GV, Info, reg);
       if (!PointerSlot)
@@ -1504,6 +1562,37 @@ static Constant *tryReplacePeriodAbsoluteAddress(
       void *Pointee = nullptr;
       std::memcpy(&Pointee, PointerSlot, sizeof(Pointee));
       const uintptr_t PointeeBase = reinterpret_cast<uintptr_t>(Pointee);
+      const std::string Name = GV->getName().str();
+      const bool Explicit = reg.getPointerPeriodBounds(Name);
+      // Explicit bounds select the strict path even for a constant index.
+      // Discovered bounds are only consulted for witness-derived addresses,
+      // so constant addresses keep the legacy decision below.
+      std::optional<PointerPeriodBounds> Bounds;
+      if (Explicit || UsedAssumption)
+        Bounds = reg.resolvePointerPeriodBounds(Name, Pointee);
+      if (Bounds) {
+        uint64_t Relative = 0;
+        if (Pointee == Bounds->base &&
+            hasAbsoluteAddressContract(F, Info.periodName) &&
+            absoluteRangeContains(PointeeBase, Bounds->size, Target,
+                                  AccessSize, Relative) &&
+            absoluteGEPChainFitsObject(LI->getPointerOperand(), DL, Assumed,
+                                       PointeeBase, Bounds->size) &&
+            boundedPointerFieldAuthorized(*GV, Bounds->size, Relative,
+                                          AccessSize)) {
+          if (Explicit) {
+            Candidate = reinterpret_cast<const uint8_t *>(Target);
+            ++Matches;
+          } else {
+            DiscoveredCandidate = reinterpret_cast<const uint8_t *>(Target);
+            ++DiscoveredMatches;
+          }
+        }
+        // A failed strict check never falls through to the legacy matcher.
+        continue;
+      }
+      if (UsedAssumption)
+        continue;
       if (!PointeeBase || Target < PointeeBase)
         continue;
       const uint64_t FieldOffset = Target - PointeeBase;
@@ -1545,6 +1634,8 @@ static Constant *tryReplacePeriodAbsoluteAddress(
   // authorized field; that alias/lifetime precondition is what prevents an
   // arbitrary map entry from winning. Cross-lifecycle or otherwise eligible
   // overlap remains ambiguous.
+  if (!Matches && DiscoveredMatches == 1)
+    return createConstantFromMemory(DiscoveredCandidate, LI->getType(), DL);
   if (Matches != 1)
     return nullptr;
   return createConstantFromMemory(Candidate, LI->getType(), DL);
@@ -1698,6 +1789,11 @@ tryReplaceIndirect(LoadInst *LI, const Value *PtrOp,
     }
   }
   if (!PtrGV)
+    return nullptr;
+
+  // Pointer materialization exposes the strict absolute-address path on the
+  // next pass. Do not bypass its bounds/field checks in this legacy fallback.
+  if (reg.getPointerPeriodBounds(PtrGV->getName().str()))
     return nullptr;
 
   auto it = gvMap.find(PtrGV);
