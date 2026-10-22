@@ -893,8 +893,13 @@ void EJitOptimizer::runStructFieldPass(Module &M,
   EJitStructFieldPass structField(registry_, BoundPointers, ctx.fnName);
   structField.initFromModule(M);
   for (Function &F : M.functions())
-    if (!F.isDeclaration())
-      structField.run(F, FAM_);
+    if (!F.isDeclaration()) {
+      // This pass is invoked directly rather than through a pass manager.
+      // Honor its invalidation result: in particular LastRunTrackingAnalysis
+      // must not tell the next InstCombine that no IR changed since its run.
+      PreservedAnalyses PA = structField.run(F, FAM_);
+      FAM_.invalidate(F, PA);
+    }
 }
 
 void EJitOptimizer::runStructFieldPass(Module &M) {
