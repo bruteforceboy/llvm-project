@@ -11,16 +11,8 @@
 
 #include "llvm/ExecutionEngine/EJIT/EJitCommon.h"
 #include "llvm/IR/PassManager.h"
-#include "llvm/Transforms/EmbeddedJIT/EJitFreeDim.h"
 
 namespace llvm {
-
-struct EJitLowerFreeDimPass : public PassInfoMixin<EJitLowerFreeDimPass> {
-  PreservedAnalyses run(Module &M, ModuleAnalysisManager &) {
-    return lowerEJitLocalFreeDims(M) ? PreservedAnalyses::none()
-                                   : PreservedAnalyses::all();
-  }
-};
 
 struct EJitRegisterBitcodePass
     : public PassInfoMixin<EJitRegisterBitcodePass> {

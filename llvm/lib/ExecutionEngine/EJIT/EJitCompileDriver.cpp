@@ -692,8 +692,9 @@ void *EJitCompileDriver::compileCold(uint64_t cacheKey, uint32_t tier,
     if (logger_)
       logger_->log(EJIT_ERR_COMPILE_FAILED, "Failed to load bitcode module",
                    funcName, std::to_string(cacheKey));
-#endif
+#else
     consumeError(std::move(Err));
+#endif
     return nullptr;
   }
 
@@ -708,8 +709,9 @@ void *EJitCompileDriver::compileCold(uint64_t cacheKey, uint32_t tier,
       logger_->log(EJIT_ERR_COMPILE_FAILED,
                    "Failed to look up compiled function", funcName,
                    std::to_string(cacheKey));
-#endif
+#else
     consumeError(addrOrErr.takeError());
+#endif
     return nullptr;
   }
 

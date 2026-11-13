@@ -25,8 +25,6 @@
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/VirtualFileSystem.h"
 #include "llvm/Transforms/IPO/Inliner.h"
-#include "llvm/Transforms/EmbeddedJIT/EJitFreeDim.h"
-#include "llvm/ADT/ScopeExit.h"
 #include "llvm/Transforms/IPO/SCCP.h"
 #include "llvm/Transforms/InstCombine/InstCombine.h"
 #include "llvm/Transforms/Instrumentation/InstrProfiling.h"
@@ -76,9 +74,8 @@ static bool mayConstSitesCorrespond(const EJitMayConstLoadSite &L,
 }
 #endif
 
-EJitOptimizer::EJitOptimizer(PeriodArrayRegistry &reg, TargetMachine *TM,
-                             bool verifySubstitution)
-    : registry_(reg), verifySubstitution_(verifySubstitution) {
+EJitOptimizer::EJitOptimizer(PeriodArrayRegistry &reg, TargetMachine *TM)
+    : registry_(reg) {
   // Use the real llvm::PassBuilder to register the FULL analysis set. The O2
   // function-simplification pipeline (GVN, CorrelatedValuePropagation, etc.)
   // needs analyses the minimal EJitPassBuilder does not register (~13 vs ~40).
@@ -146,16 +143,6 @@ void EJitOptimizer::clearAnalyses() {
 }
 
 void EJitOptimizer::runPipeline(Module &M, const SpecializationContext &ctx) {
-  // All tier exits, including temporary PGO Gen and audit-only Baseline, must
-  // return executable IR with real runtime inputs and no private marker.
-  auto LowerFreeDims = make_scope_exit([&] {
-    if (lowerEJitLocalFreeDims(M))
-      EJIT_DIAG_VERBOSE("local-free-dim remaining boundaries lowered to real inputs");
-    // ORC destroys the module/context after materialization. MemorySSA and
-    // other cached analysis results must die while their IR is still alive,
-    // including unmarked modules and rejected-boundary fallback paths.
-    clearAnalyses();
-  });
   EJIT_DIAG_VERBOSE("pipeline begin func=%s key=0x%016lx opt=%d dims=%zu "
                     "tier=%d module=%s",
                     ctx.fnName.c_str(), ctx.cacheKey,
@@ -185,12 +172,6 @@ void EJitOptimizer::runPipeline(Module &M, const SpecializationContext &ctx) {
   }
 #if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_DIAG_ENABLE)
   lastMayConstLoadSites_.clear();
-#endif
-
-#ifdef EJIT_VERIFY_SUBSTITUTION
-  if (verifySubstitution_)
-    EJIT_DIAG("verify mode: checking may_const values instead of freezing "
-              "them; diagnostic image, not a performance measurement");
 #endif
 
 #if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_DIAG_ENABLE)
@@ -391,7 +372,7 @@ void EJitOptimizer::runPipeline(Module &M, const SpecializationContext &ctx) {
       // publish module profile-free so audit-only mode is behaviorally the
       // same optimization pipeline as ejit_init() Baseline.
       clearAnalyses();
-      runOptimizationPipeline(M, ctx, CompileTier::Baseline);
+      runOptimizationPipeline(M, ctx.optLevel, CompileTier::Baseline);
 #if defined(EJIT_DIAG_ENABLE)
       auto FinalSites = collectMayConstSites(M, registry_);
       recordMayConstBenefit(ctx, AuditInputSites, AuditSpecializedMayConstLoads,
@@ -450,7 +431,7 @@ void EJitOptimizer::runPipeline(Module &M, const SpecializationContext &ctx) {
           SpecFPM.run(F, FAM_);
     }
 #endif
-    runOptimizationPipeline(M, ctx, ctx.tier);
+    runOptimizationPipeline(M, ctx.optLevel, ctx.tier);
 #if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_DIAG_ENABLE)
     auto FinalSites = collectMayConstSites(M, registry_);
     recordMayConstBenefit(ctx, AuditInputSites, AuditSpecializedMayConstLoads,
@@ -462,7 +443,7 @@ void EJitOptimizer::runPipeline(Module &M, const SpecializationContext &ctx) {
   }
 
   // Baseline (PGO off): the existing full specialization pipeline.
-  runOptimizationPipeline(M, ctx, ctx.tier);
+  runOptimizationPipeline(M, ctx.optLevel, ctx.tier);
 #if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_DIAG_ENABLE)
   auto FinalSites = collectMayConstSites(M, registry_);
   recordMayConstBenefit(ctx, AuditInputSites, AuditSpecializedMayConstLoads,
@@ -938,11 +919,7 @@ void EJitOptimizer::runStructFieldPass(Module &M,
       }
     }
   }
-  SmallVector<EJitLocalWitnessPeriod, 4> LocalPeriods;
-  for (const auto &Dim : ctx.dimensions)
-    LocalPeriods.push_back({Dim.periodName, Dim.cellIdx});
-  EJitStructFieldPass structField(registry_, BoundPointers, ctx.fnName,
-                                  LocalPeriods, verifySubstitution_);
+  EJitStructFieldPass structField(registry_, BoundPointers, ctx.fnName);
   structField.initFromModule(M);
   for (Function &F : M.functions())
     if (!F.isDeclaration()) {
@@ -952,6 +929,11 @@ void EJitOptimizer::runStructFieldPass(Module &M,
       PreservedAnalyses PA = structField.run(F, FAM_);
       FAM_.invalidate(F, PA);
     }
+}
+
+void EJitOptimizer::runStructFieldPass(Module &M) {
+  SpecializationContext Empty;
+  runStructFieldPass(M, Empty);
 }
 
 FunctionPassManager &
@@ -968,9 +950,8 @@ EJitOptimizer::simplifyFPMForLevel(ejit::OptimizationLevel level) {
 }
 
 void EJitOptimizer::runOptimizationPipeline(Module &M,
-                                            const SpecializationContext &ctx,
+                                            ejit::OptimizationLevel level,
                                             CompileTier tier) {
-  const auto level = ctx.optLevel;
   EJIT_DIAG_DEBUG("pipeline stage5: optimization pipeline module=%s opt=%d",
                   M.getName().str().c_str(), static_cast<int>(level));
 
@@ -991,7 +972,7 @@ void EJitOptimizer::runOptimizationPipeline(Module &M,
   // Phase 4: unrolling exposed new constant-index array accesses
   // (g_arr[k].field -> g_arr[0].field, g_arr[1].field, ...). Substitute them,
   // then fold/propagate/simplify the freshly-constant values.
-  runStructFieldPass(M, ctx);
+  runStructFieldPass(M);
   for (Function &F : M.functions())
     if (!F.isDeclaration()) {
       cleanupFPM_.run(F, FAM_);
