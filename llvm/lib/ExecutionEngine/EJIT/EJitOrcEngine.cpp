@@ -10,7 +10,6 @@
 #include "llvm/ExecutionEngine/EJIT/EJitLinkDiagPlugin.h"
 #include "llvm/ExecutionEngine/EJIT/EJitLinkOptimizationPlugin.h"
 #include "llvm/ExecutionEngine/EJIT/EJitOptimizer.h"
-#include "llvm/Transforms/EmbeddedJIT/EJitFreeDim.h"
 #include "llvm/ExecutionEngine/EJIT/EJitRuntimeState.h"
 #include "llvm/ExecutionEngine/Orc/Core.h"
 #include "llvm/ExecutionEngine/Orc/LLJIT.h"
@@ -824,7 +823,7 @@ EJitOrcEngine::Create(const Config &config, PeriodArrayRegistry &periodReg,
   // Create persistent optimizer — analysis managers are registered once here
   // and reused across compilations (cleared between runs).
   engine->P->optimizer = std::make_unique<EJitOptimizer>(
-      periodReg, engine->P->dumpFunctionTM.get(), config.verifySubstitution);
+      periodReg, engine->P->dumpFunctionTM.get());
 
   // Register all known global variable addresses from the PeriodArrayRegistry
   // so that external global references in any loaded bitcode module resolve
@@ -1008,8 +1007,7 @@ Error EJitOrcEngine::loadBitcodeModule(StringRef bitcodeData, uint64_t cacheKey,
                     origFnName.c_str(), bitcodeData.size());
   auto Ctx = std::make_unique<LLVMContext>();
   auto Buf = MemoryBuffer::getMemBuffer(
-      bitcodeData, ("spec_" + std::to_string(cacheKey) + ".bc"),
-      /*RequiresNullTerminator=*/false);
+      bitcodeData, ("spec_" + std::to_string(cacheKey) + ".bc"));
   auto ModuleOrErr = parseBitcodeFile(Buf->getMemBufferRef(), *Ctx);
   if (!ModuleOrErr) {
     EJIT_DIAG("loadBitcode FAIL key=0x%016lx: parse bitcode error", cacheKey);
@@ -1131,8 +1129,7 @@ Error EJitOrcEngine::loadBitcodeModule(StringRef bitcodeData, uint64_t cacheKey,
   collectReferencedExternalDecls(**ModuleOrErr, ReferencedExternalFuncs,
                                  ReferencedExternalGlobals);
   for (Function &F : (*ModuleOrErr)->functions()) {
-    if (!F.isDeclaration() || F.getName().empty() ||
-        isEJitLocalFreeDimFunction(F))
+    if (!F.isDeclaration() || F.getName().empty())
       continue;
     std::string name = F.getName().str();
     if (globalSymbols.count(P->J->mangleAndIntern(name)))
