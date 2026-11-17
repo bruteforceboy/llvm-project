@@ -122,7 +122,7 @@ EJitOptimizer::EJitOptimizer(PeriodArrayRegistry &reg, TargetMachine *TM)
   // constant-index GEPs (g_arr[0]/[1]/...), which only then become substitutable.
   // Once StructFieldPass replaces them, this fold/propagate/simplify pass
   // collapses the freshly-constant values and drops what became dead — the same
-  // treatment Phase 2 gave the first wave of constants.
+  // treatment Phase 3 gave the first wave of constants.
   cleanupFPM_.addPass(InstCombinePass());
   cleanupFPM_.addPass(SCCPPass());
   cleanupFPM_.addPass(SimplifyCFGPass());

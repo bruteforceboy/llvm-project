@@ -677,8 +677,8 @@ ejit_status_t ejit_activate(const char *periodName, uint32_t cellIdx) {
   }
   EJIT_DIAG("activate(%s,%u)", periodName, cellIdx);
   // In a taskpool build this also syncs the SwitchController and returns false
-  // for an unknown lifecycle (no state changed). Without EJIT_SRE_TASKPOOL it
-  // always succeeds.
+  // when periodName is neither a registered lifecycle nor a registered period
+  // array (no state changed). Without EJIT_SRE_TASKPOOL it always succeeds.
   if (!gEJIT->activate(periodName, cellIdx))
     return EJIT_ERR_INVALID_PARAM;
   return EJIT_OK;
@@ -697,7 +697,7 @@ ejit_status_t ejit_deactivate(const char *periodName, uint32_t cellIdx) {
   }
   EJIT_DIAG("deactivate(%s,%u)", periodName, cellIdx);
   if (!gEJIT->deactivate(periodName, cellIdx))
-    return EJIT_ERR_INVALID_PARAM; // unknown lifecycle: nothing changed.
+    return EJIT_ERR_INVALID_PARAM; // Unknown period: nothing changed.
   gEJIT->invalidateByPeriod(periodName, cellIdx);
   return EJIT_OK;
 }

@@ -168,7 +168,7 @@ private:
   static void sharedOwnerReleased(void *ctx);
 #endif
   /// Cold compile path (decode → verify active → load bitcode → JIT compile).
-  /// When \p storeLru is true the result is inserted into the LRU EJitCache.
+  /// \p storeLru is unused.
   /// \p tier is the CompileTier (uint32_t, EJitOrcEngine.h) decoded from
   /// the request's funcIndex high bits (EJitSreQueue.h); gated by
   /// Config::enablePgo (off => Baseline regardless).
